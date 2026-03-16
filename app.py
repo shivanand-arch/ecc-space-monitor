@@ -105,23 +105,31 @@ def get_credentials():
 
     # 3. Check Streamlit secrets (for cloud deployment)
     try:
-        token_data = st.secrets.get("GOOGLE_TOKEN", None)
+        token_data = None
+        if "GOOGLE_TOKEN" in st.secrets:
+            token_data = st.secrets["GOOGLE_TOKEN"]
         if token_data:
-            info = json.loads(token_data) if isinstance(token_data, str) else dict(token_data)
+            if isinstance(token_data, str):
+                info = json.loads(token_data)
+            else:
+                info = dict(token_data)
             creds = Credentials(
-                token=info.get("token"),
+                token=info.get("token", ""),
                 refresh_token=info.get("refresh_token"),
                 token_uri=info.get("token_uri", "https://oauth2.googleapis.com/token"),
                 client_id=info.get("client_id"),
                 client_secret=info.get("client_secret"),
                 scopes=SCOPES,
             )
-            if creds.expired and creds.refresh_token:
-                creds.refresh(Request())
+            if creds.refresh_token:
+                try:
+                    creds.refresh(Request())
+                except Exception:
+                    pass
             st.session_state["google_creds"] = creds
             return creds
-    except Exception:
-        pass
+    except Exception as e:
+        st.sidebar.warning(f"Token from secrets failed: {e}")
 
     return None
 
