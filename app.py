@@ -2,7 +2,10 @@ import streamlit as st
 import json
 import os
 import datetime
+import hashlib
+import secrets
 import pandas as pd
+import requests as req
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
@@ -12,6 +15,8 @@ import anthropic
 SCOPES = ["https://www.googleapis.com/auth/chat.spaces.readonly",
           "https://www.googleapis.com/auth/chat.messages.readonly",
           "https://www.googleapis.com/auth/chat.memberships.readonly"]
+
+LOGIN_SCOPES = ["openid", "email", "profile"]
 
 TARGET_SPACES = [
     "(New) ECC DRI's Huddle",
@@ -26,50 +31,162 @@ CLIENT_SECRET_PATH = os.path.join(BASE_DIR, "client_secret.json")
 
 ALLOWED_DOMAIN = "exotel.com"
 
+# OAuth client for user login (from secrets or client_secret.json)
+def _get_login_client():
+    try:
+        return st.secrets["GOOGLE_CLIENT_ID"], st.secrets["GOOGLE_CLIENT_SECRET"]
+    except Exception:
+        pass
+    if os.path.exists(CLIENT_SECRET_PATH):
+        with open(CLIENT_SECRET_PATH) as f:
+            info = json.load(f).get("web", {})
+            return info.get("client_id", ""), info.get("client_secret", "")
+    return "", ""
+
+LOGIN_CLIENT_ID, LOGIN_CLIENT_SECRET = _get_login_client()
+
 st.set_page_config(page_title="ECC Space Monitor", page_icon="📊", layout="wide")
 
 
-# ── Email Gate ──────────────────────────────────────────────────────────────
-def check_email_access():
-    """Require @exotel.com email to access the app."""
+# ── Google OAuth Login ──────────────────────────────────────────────────────
+def _get_redirect_uri():
+    """Detect the correct redirect URI based on environment."""
+    # Check if running on Streamlit Cloud
+    try:
+        app_url = st.secrets.get("APP_URL", "")
+        if app_url:
+            return app_url.rstrip("/")
+    except Exception:
+        pass
+    return "http://localhost:8501"
+
+
+def _build_google_auth_url():
+    """Build Google OAuth2 authorization URL for user login."""
+    redirect_uri = _get_redirect_uri()
+    state = secrets.token_urlsafe(32)
+    st.session_state["oauth_login_state"] = state
+
+    params = {
+        "client_id": LOGIN_CLIENT_ID,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": " ".join(LOGIN_SCOPES),
+        "access_type": "online",
+        "state": state,
+        "hd": ALLOWED_DOMAIN,  # Restrict to exotel.com in Google's UI
+        "prompt": "select_account",
+    }
+    qs = "&".join(f"{k}={v}" for k, v in params.items())
+    return f"https://accounts.google.com/o/oauth2/v2/auth?{qs}"
+
+
+def _exchange_code_for_user_info(code):
+    """Exchange authorization code for user info."""
+    redirect_uri = _get_redirect_uri()
+    token_resp = req.post("https://oauth2.googleapis.com/token", data={
+        "code": code,
+        "client_id": LOGIN_CLIENT_ID,
+        "client_secret": LOGIN_CLIENT_SECRET,
+        "redirect_uri": redirect_uri,
+        "grant_type": "authorization_code",
+    })
+    token_data = token_resp.json()
+    if "error" in token_data:
+        return None, f"Token error: {token_data.get('error_description', token_data['error'])}"
+
+    # Get user info
+    userinfo_resp = req.get("https://www.googleapis.com/oauth2/v2/userinfo",
+                            headers={"Authorization": f"Bearer {token_data['access_token']}"})
+    userinfo = userinfo_resp.json()
+    return userinfo, None
+
+
+def check_google_auth():
+    """Handle Google OAuth login flow. Returns True if authenticated."""
+    # Already authenticated
     if "authenticated_email" in st.session_state and st.session_state["authenticated_email"]:
         return True
 
+    # Check for OAuth callback
+    params = st.query_params
+    code = params.get("code")
+    if code:
+        # Prevent reuse
+        if "last_login_code" not in st.session_state or st.session_state["last_login_code"] != code:
+            st.session_state["last_login_code"] = code
+            userinfo, error = _exchange_code_for_user_info(code)
+            if error:
+                st.error(error)
+                st.query_params.clear()
+                return False
+            email = userinfo.get("email", "").lower()
+            if not email.endswith(f"@{ALLOWED_DOMAIN}"):
+                st.error(f"Access restricted to @{ALLOWED_DOMAIN} accounts. You signed in as {email}.")
+                st.query_params.clear()
+                return False
+            st.session_state["authenticated_email"] = email
+            st.session_state["user_name"] = userinfo.get("name", email)
+            st.session_state["user_picture"] = userinfo.get("picture", "")
+            st.query_params.clear()
+            st.rerun()
+        else:
+            st.query_params.clear()
+            return "authenticated_email" in st.session_state and bool(st.session_state["authenticated_email"])
+
+    # Show login page
     st.markdown("""
     <style>
-        .login-box {
-            max-width: 450px;
-            margin: 80px auto;
-            background: white;
-            border-radius: 16px;
-            padding: 40px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
-            text-align: center;
+        .login-container {
+            display: flex; align-items: center; justify-content: center;
+            min-height: 70vh;
         }
-        .login-title { font-size: 24px; font-weight: 700; color: #1a1a2e; margin-bottom: 8px; }
-        .login-subtitle { font-size: 14px; color: #666; margin-bottom: 24px; }
+        .login-box {
+            max-width: 420px; width: 100%;
+            background: white; border-radius: 16px;
+            padding: 48px 40px; text-align: center;
+            box-shadow: 0 4px 24px rgba(0,0,0,0.12);
+        }
+        .login-title { font-size: 26px; font-weight: 700; color: #1a1a2e; margin-bottom: 8px; }
+        .login-subtitle { font-size: 14px; color: #666; margin-bottom: 32px; }
+        .google-btn {
+            display: inline-flex; align-items: center; justify-content: center; gap: 12px;
+            background: #fff; color: #3c4043; border: 1px solid #dadce0;
+            border-radius: 8px; padding: 12px 24px; font-size: 15px; font-weight: 500;
+            text-decoration: none; transition: all 0.2s;
+            width: 100%; box-sizing: border-box;
+        }
+        .google-btn:hover { background: #f7f8f8; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .google-icon { width: 20px; height: 20px; }
+        .domain-note { font-size: 12px; color: #999; margin-top: 16px; }
     </style>
-    <div class="login-box">
-        <div class="login-title">ECC Space Monitor</div>
-        <div class="login-subtitle">Sign in with your Exotel email to continue</div>
+    """, unsafe_allow_html=True)
+
+    auth_url = _build_google_auth_url()
+
+    st.markdown(f"""
+    <div class="login-container">
+        <div class="login-box">
+            <div class="login-title">ECC Space Monitor</div>
+            <div class="login-subtitle">AI-powered Google Chat space analysis</div>
+            <a href="{auth_url}" class="google-btn">
+                <svg class="google-icon" viewBox="0 0 24 24">
+                    <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z"/>
+                    <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+                    <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
+                    <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+                </svg>
+                Sign in with Google
+            </a>
+            <div class="domain-note">Restricted to @exotel.com accounts</div>
+        </div>
     </div>
     """, unsafe_allow_html=True)
 
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        email = st.text_input("Enter your Exotel email", placeholder="yourname@exotel.com")
-        if st.button("Sign In", type="primary", use_container_width=True):
-            if not email:
-                st.error("Please enter your email.")
-            elif not email.strip().lower().endswith(f"@{ALLOWED_DOMAIN}"):
-                st.error("Access restricted to @exotel.com email addresses only.")
-            else:
-                st.session_state["authenticated_email"] = email.strip().lower()
-                st.rerun()
     return False
 
 
-if not check_email_access():
+if not check_google_auth():
     st.stop()
 
 
@@ -340,6 +457,24 @@ AVAILABLE SPACE MESSAGES:
 
 # ── Sidebar ─────────────────────────────────────────────────────────────────
 with st.sidebar:
+    # User info
+    user_name = st.session_state.get("user_name", "")
+    user_email = st.session_state.get("authenticated_email", "")
+    user_pic = st.session_state.get("user_picture", "")
+    if user_pic:
+        st.markdown(f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">'
+                    f'<img src="{user_pic}" style="width:32px;height:32px;border-radius:50%;">'
+                    f'<div><div style="font-weight:600;font-size:14px;color:white;">{user_name}</div>'
+                    f'<div style="font-size:11px;color:#aaa;">{user_email}</div></div></div>',
+                    unsafe_allow_html=True)
+    elif user_email:
+        st.markdown(f"**{user_email}**")
+    if st.button("Logout", use_container_width=True, key="logout_btn"):
+        for key in ["authenticated_email", "user_name", "user_picture", "last_login_code"]:
+            st.session_state.pop(key, None)
+        st.rerun()
+
+    st.divider()
     st.markdown("## ECC Space Monitor")
     st.markdown(f'<span class="status-dot"></span> Monitoring {len(TARGET_SPACES)} spaces',
                 unsafe_allow_html=True)
