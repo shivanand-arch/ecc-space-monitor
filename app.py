@@ -24,7 +24,54 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKEN_PATH = os.path.join(BASE_DIR, "token.json")
 CLIENT_SECRET_PATH = os.path.join(BASE_DIR, "client_secret.json")
 
+ALLOWED_DOMAIN = "exotel.com"
+
 st.set_page_config(page_title="ECC Space Monitor", page_icon="📊", layout="wide")
+
+
+# ── Email Gate ──────────────────────────────────────────────────────────────
+def check_email_access():
+    """Require @exotel.com email to access the app."""
+    if "authenticated_email" in st.session_state and st.session_state["authenticated_email"]:
+        return True
+
+    st.markdown("""
+    <style>
+        .login-box {
+            max-width: 450px;
+            margin: 80px auto;
+            background: white;
+            border-radius: 16px;
+            padding: 40px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+        .login-title { font-size: 24px; font-weight: 700; color: #1a1a2e; margin-bottom: 8px; }
+        .login-subtitle { font-size: 14px; color: #666; margin-bottom: 24px; }
+    </style>
+    <div class="login-box">
+        <div class="login-title">ECC Space Monitor</div>
+        <div class="login-subtitle">Sign in with your Exotel email to continue</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        email = st.text_input("Enter your Exotel email", placeholder="yourname@exotel.com")
+        if st.button("Sign In", type="primary", use_container_width=True):
+            if not email:
+                st.error("Please enter your email.")
+            elif not email.strip().lower().endswith(f"@{ALLOWED_DOMAIN}"):
+                st.error("Access restricted to @exotel.com email addresses only.")
+            else:
+                st.session_state["authenticated_email"] = email.strip().lower()
+                st.rerun()
+    return False
+
+
+if not check_email_access():
+    st.stop()
+
 
 # ── CSS ─────────────────────────────────────────────────────────────────────
 st.markdown("""
