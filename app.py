@@ -4,7 +4,7 @@ ECC Space Monitor — main Streamlit app.
 Thin UI layer; business logic lives in:
   config.py        — constants
   login.py         — Google OAuth login gate
-  chat_api.py      — Chat API client + full message repository
+  chat_api.py      — Chat API client + tiered message repository
   llm_client.py    — Claude analysis & Q&A
   message_utils.py — text extraction, context building, HTML escaping
   date_parser.py   — deterministic date-range extraction
@@ -18,7 +18,7 @@ import streamlit as st
 from config import (
     BASE_DIR,
     CLIENT_SECRET_PATH,
-    DEFAULT_DASHBOARD_DAYS,
+    STARTUP_LOOKBACK_DAYS,
     TARGET_SPACE_NAMES,
     TOKEN_PATH,
     MAX_CHAT_HISTORY_MESSAGES,
@@ -27,7 +27,8 @@ from login import check_google_auth
 from chat_api import (
     get_credentials,
     fetch_spaces,
-    load_full_repository,
+    startup_load,
+    incremental_refresh,
     repo_needs_refresh,
     repo_last_refreshed,
     get_all_messages,
@@ -96,7 +97,6 @@ st.markdown("""
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
-    # User info
     user_name = safe(st.session_state.get("user_name", ""))
     user_email = safe(st.session_state.get("authenticated_email", ""))
     user_pic = st.session_state.get("user_picture", "")
@@ -145,10 +145,11 @@ with st.sidebar:
         stats = get_repo_stats()
         st.divider()
         st.markdown("**Message Repository**")
-        st.caption(f"{stats['total']:,} total messages")
+        st.caption(f"{stats['total']:,} messages loaded")
         if stats["earliest"] and stats["latest"]:
             st.caption(f"Coverage: {stats['earliest']} to {stats['latest']}")
         st.caption(f"Last refresh: {_rr.strftime('%I:%M %p')}")
+        st.caption("Older data fetched automatically on demand")
 
     st.divider()
     if st.button("Clear Chat History", use_container_width=True):
@@ -164,7 +165,7 @@ with st.sidebar:
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 st.markdown("# ECC Space Monitor")
-st.caption("Full message repository with AI-powered search and analysis")
+st.caption("AI-powered search and analysis across Google Chat spaces")
 
 # Chat API credentials
 creds = get_credentials()
@@ -218,22 +219,26 @@ if not spaces:
             st.error(str(e))
     st.stop()
 
-# ── Load full message repository ─────────────────────────────────────────────
-if repo_needs_refresh():
-    progress_bar = st.progress(0, text="Loading full message repository (one-time)...")
-    load_full_repository(creds_json, spaces, progress_callback=progress_bar.progress)
+# ── Load message repository ──────────────────────────────────────────────────
+# Tier 1: Fast startup with last 30 days
+if repo_last_refreshed() is None:
+    progress_bar = st.progress(0, text=f"Loading last {STARTUP_LOOKBACK_DAYS} days of messages...")
+    startup_load(creds_json, spaces, progress_callback=progress_bar.progress)
     progress_bar.empty()
+elif repo_needs_refresh():
+    with st.spinner("Refreshing new messages..."):
+        incremental_refresh(creds_json, spaces)
 
-# Get all messages (full history) and a recent slice for the dashboard
+# Get current data
 all_messages_by_space = get_all_messages()
 total_msg_count = sum(len(v) for v in all_messages_by_space.values())
+stats = get_repo_stats()
 
-# For the default conversation context (chat), use all messages
+# Default conversation context: all currently loaded messages
 conversation_context = build_conversation_context(all_messages_by_space)
 
 # ── Metrics row ──────────────────────────────────────────────────────────────
 st.markdown("---")
-stats = get_repo_stats()
 mcol1, mcol2, mcol3, mcol4 = st.columns(4)
 with mcol1:
     st.markdown(
@@ -244,13 +249,11 @@ with mcol1:
 with mcol2:
     st.markdown(
         f'<div class="metric-card"><div class="metric-value">{total_msg_count:,}</div>'
-        f'<div class="metric-label">Total Messages</div></div>',
+        f'<div class="metric-label">Messages Loaded</div></div>',
         unsafe_allow_html=True,
     )
 with mcol3:
-    coverage = "N/A"
-    if stats["earliest"]:
-        coverage = f'{stats["earliest"]}'
+    coverage = stats.get("earliest", "N/A") or "N/A"
     st.markdown(
         f'<div class="metric-card"><div class="metric-value">{coverage}</div>'
         f'<div class="metric-label">Data Since</div></div>',
@@ -275,9 +278,9 @@ tab_chat, tab_dashboard = st.tabs(["Ask Anything", "Space Dashboard"])
 with tab_chat:
     st.markdown("### Ask anything about your spaces")
     st.caption(
-        f"Full repository: {total_msg_count:,} messages"
-        + (f" from {stats['earliest']}" if stats["earliest"] else "")
-        + ". Ask about any time period."
+        f"{total_msg_count:,} messages loaded"
+        + (f" (since {stats['earliest']})" if stats.get("earliest") else "")
+        + ". Older data fetched automatically when needed."
     )
 
     with st.expander("Example questions you can ask"):
@@ -286,9 +289,9 @@ with tab_chat:
 - What happened with Central Registrar issues in the last 2 weeks?
 - Summarize what happened in Panic Room this week
 - Show me all customer escalations from January 2024
-- Compare the activity level between DRI's Huddle and ECC Panic Room
+- Compare the activity between DRI's Huddle and ECC Panic Room
 - What decisions were made in the last 24 hours?
-- List all mentions of [customer name / topic] ever
+- List all mentions of [customer name / topic]
 - Give me an executive briefing for the past month
 - What were the major incidents in Q4 2025?
         """)
@@ -322,15 +325,21 @@ with tab_chat:
                     if date_range:
                         q_start, q_end = date_range
                         date_label = f"{q_start} to {q_end}"
-                        with st.spinner(f"Filtering messages for {date_label}..."):
-                            q_messages_by_space = get_messages_for_range(q_start, q_end)
+
+                        # This automatically fetches older data if needed
+                        with st.spinner(f"Searching messages ({date_label})..."):
+                            q_messages_by_space = get_messages_for_range(
+                                q_start, q_end,
+                                creds_json=creds_json,
+                                spaces=spaces,
+                            )
                             chat_context = build_conversation_context(q_messages_by_space)
                             total_q = sum(len(v) for v in q_messages_by_space.values())
                         st.caption(f"📅 {date_label} — {total_q:,} messages")
                     else:
-                        # No date specified — search across ALL messages
+                        # No date in query — use all loaded messages
                         chat_context = conversation_context
-                        date_label = f"Full history ({stats['earliest']} to {stats['latest']})"
+                        date_label = f"All loaded data ({stats.get('earliest', '?')} to {stats.get('latest', '?')})"
 
                     # Step 3: Answer
                     with st.spinner("Analyzing..."):
@@ -346,7 +355,7 @@ with tab_chat:
                             {"role": "assistant", "content": response}
                         )
 
-                    # Trim history to keep within budget
+                    # Trim history
                     if len(st.session_state["chat_messages"]) > MAX_CHAT_HISTORY_MESSAGES:
                         st.session_state["chat_messages"] = (
                             st.session_state["chat_messages"][-MAX_CHAT_HISTORY_MESSAGES:]
@@ -374,7 +383,7 @@ with tab_dashboard:
             st.markdown(
                 f'<div class="space-card">'
                 f'<h3>{safe(display_name)}</h3>'
-                f'<p>{len(messages):,} total messages | Space ID: <code>{safe(space_id)}</code></p>'
+                f'<p>{len(messages):,} messages loaded | Space ID: <code>{safe(space_id)}</code></p>'
                 f'</div>',
                 unsafe_allow_html=True,
             )
@@ -384,7 +393,6 @@ with tab_dashboard:
             with left:
                 st.markdown("### AI Analysis")
                 if api_key:
-                    # Hash-based cache key — skip re-analysis if nothing changed
                     cache_key = analysis_cache_key(space_id, messages)
                     analysis_state_key = f"analysis_{cache_key}"
 
@@ -406,7 +414,7 @@ with tab_dashboard:
 
             with right:
                 st.markdown("### Recent Messages")
-                for m in messages[-30:]:  # show most recent 30
+                for m in messages[-30:]:
                     sender = safe(get_sender_name(m))
                     text = safe(extract_text(m)[:300])
                     time = safe(format_time(m.get("createTime", "")))

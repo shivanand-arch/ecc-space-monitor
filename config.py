@@ -21,9 +21,6 @@ CHAT_SCOPES = [
 LOGIN_SCOPES = ["openid", "email", "profile"]
 
 # ── Spaces to monitor ────────────────────────────────────────────────────────
-# Display names used for initial discovery; once found the stable space-id
-# (e.g. "spaces/AAAA...") is cached in session state for the rest of the
-# session so a rename won't break anything mid-session.
 TARGET_SPACE_NAMES = [
     "(New) ECC DRI's Huddle",
     "(New) ECC Panic Room",
@@ -38,9 +35,10 @@ ALLOWED_DOMAIN = "exotel.com"
 MAX_MESSAGES_PER_SPACE = 50_000    # safety cap per API pagination run
 MAX_CONTEXT_CHARS = 500_000        # ~125K tokens sent to Claude
 
-# ── Cache ────────────────────────────────────────────────────────────────────
-CACHE_TTL_SECONDS = 3600           # auto-refresh interval (1 hour)
-DEFAULT_DASHBOARD_DAYS = 7         # default for dashboard Recent Messages panel
+# ── Cache / repository ───────────────────────────────────────────────────────
+STARTUP_LOOKBACK_DAYS = 30         # fast startup: only last 30 days
+CACHE_TTL_SECONDS = 3600           # hourly incremental refresh
+DEFAULT_DASHBOARD_DAYS = 7         # dashboard Recent Messages panel
 
 # ── Chat history ─────────────────────────────────────────────────────────────
 MAX_CHAT_HISTORY_MESSAGES = 20     # keep last 20 messages (10 exchanges)
