@@ -3,14 +3,17 @@ Google OAuth login gate for Streamlit.
 
 Handles:
 - OAuth URL construction (properly URL-encoded)
-- CSRF state validation
+- CSRF state validation via HMAC-signed tokens (survives session resets)
 - Domain restriction to @exotel.com
 - Session management
 """
 
+import hashlib
+import hmac
 import json
 import os
 import secrets
+import time
 from urllib.parse import urlencode
 
 import streamlit as st
@@ -65,11 +68,51 @@ def _get_redirect_uri() -> str:
     return "http://localhost:8501"
 
 
+def _get_state_secret() -> str:
+    """Derive a stable HMAC key from the OAuth client secret.
+
+    This survives Streamlit session resets / app reboots because it's
+    derived from config, not session state.
+    """
+    return LOGIN_CLIENT_SECRET
+
+
+def _make_signed_state() -> str:
+    """Create an HMAC-signed state token embedding a timestamp.
+
+    Format: ``<timestamp>.<signature>``
+    Valid for 10 minutes.
+    """
+    ts = str(int(time.time()))
+    sig = hmac.new(
+        _get_state_secret().encode(), ts.encode(), hashlib.sha256
+    ).hexdigest()[:16]
+    return f"{ts}.{sig}"
+
+
+def _verify_signed_state(state: str) -> bool:
+    """Verify a signed state token is valid and not expired (10 min window)."""
+    try:
+        ts_str, sig = state.split(".", 1)
+        ts = int(ts_str)
+    except (ValueError, AttributeError):
+        return False
+
+    # Check expiry (10 minutes)
+    if abs(time.time() - ts) > 600:
+        return False
+
+    # Check signature
+    expected_sig = hmac.new(
+        _get_state_secret().encode(), ts_str.encode(), hashlib.sha256
+    ).hexdigest()[:16]
+    return hmac.compare_digest(sig, expected_sig)
+
+
 def _build_auth_url() -> str:
     """Build the Google OAuth2 authorization URL with proper encoding."""
     redirect_uri = _get_redirect_uri()
-    state = secrets.token_urlsafe(32)
-    st.session_state["oauth_login_state"] = state
+    state = _make_signed_state()
 
     params = {
         "client_id": LOGIN_CLIENT_ID,
@@ -121,11 +164,10 @@ def check_google_auth() -> bool:
     params = st.query_params
     code = params.get("code")
     if code:
-        # ── CSRF state validation ────────────────────────────────────────
-        returned_state = params.get("state")
-        expected_state = st.session_state.get("oauth_login_state")
-        if not returned_state or returned_state != expected_state:
-            st.error("Invalid OAuth state — possible CSRF attempt. Please try again.")
+        # ── CSRF state validation (HMAC-signed, survives session resets) ─
+        returned_state = params.get("state", "")
+        if not returned_state or not _verify_signed_state(returned_state):
+            st.error("Login session expired or invalid. Please try again.")
             st.query_params.clear()
             return False
 
