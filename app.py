@@ -1,6 +1,7 @@
 import streamlit as st
 import json
 import os
+import re
 import datetime
 import hashlib
 import secrets
@@ -371,14 +372,43 @@ def format_time(time_str):
         return time_str
 
 
+def extract_message_text(msg):
+    """Extract all text content from a message, including quoted replies and annotations."""
+    parts = []
+    # Primary text content
+    text = msg.get("text", "") or ""
+    if not text:
+        text = msg.get("formattedText", "") or ""
+    if text.strip():
+        parts.append(text.strip())
+    # Quoted message (thread replies)
+    quoted = msg.get("quotedMessageMetadata", {})
+    if quoted and quoted.get("lastUpdateTime"):
+        # The quoted text is usually in the main text already, but flag it
+        pass
+    # Attachment names (often contain context like "Screenshot", ticket IDs, etc.)
+    for att in msg.get("attachment", []):
+        att_name = att.get("contentName", "")
+        if att_name:
+            parts.append(f"[Attachment: {att_name}]")
+    # Cards / card content
+    for card in msg.get("cardsV2", msg.get("cards", [])):
+        card_body = json.dumps(card) if isinstance(card, dict) else str(card)
+        # Extract just text values from card JSON
+        texts = re.findall(r'"text"\s*:\s*"([^"]+)"', card_body)
+        if texts:
+            parts.append(" | ".join(texts))
+    return " ".join(parts)
+
+
 def build_conversation_context(all_messages_by_space):
     """Build a combined context string from all spaces for the chatbot."""
     parts = []
     for space_name, messages in all_messages_by_space.items():
         msg_lines = []
-        for m in messages[:150]:
+        for m in messages:
             sender = get_sender_name(m)
-            text = m.get("text", m.get("formattedText", ""))
+            text = extract_message_text(m)
             time = format_time(m.get("createTime", ""))
             if text.strip():
                 msg_lines.append(f"[{time}] {sender}: {text}")
@@ -393,9 +423,9 @@ def analyze_messages(messages, space_display_name, api_key):
         return "No messages to analyze."
 
     msg_text = []
-    for m in messages[:150]:
+    for m in messages:
         sender = get_sender_name(m)
-        text = m.get("text", m.get("formattedText", ""))
+        text = extract_message_text(m)
         time = format_time(m.get("createTime", ""))
         if text.strip():
             msg_text.append(f"[{time}] {sender}: {text}")
