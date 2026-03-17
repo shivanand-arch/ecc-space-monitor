@@ -324,22 +324,16 @@ def fetch_spaces(_creds_json):
     return matched
 
 
-@st.cache_data(ttl=120)
-def fetch_messages(_creds_json, space_name, start_date_str, end_date_str):
-    """Fetch messages from a space within a date range.
-
-    Uses the Chat API filter on createTime and orders newest-first so the
-    most recent context is always captured even for very active spaces.
-    """
-    creds = Credentials.from_authorized_user_info(json.loads(_creds_json), SCOPES)
+def _fetch_messages_from_api(creds_json, space_name, start_date_str, end_date_str):
+    """Raw API call to fetch messages from a space within a date range."""
+    creds = Credentials.from_authorized_user_info(json.loads(creds_json), SCOPES)
     service = build("chat", "v1", credentials=creds)
 
-    # Build RFC-3339 timestamps for the filter
     start_ts = f"{start_date_str}T00:00:00Z"
     end_ts = f"{end_date_str}T23:59:59Z"
     api_filter = f'createTime > "{start_ts}" AND createTime < "{end_ts}"'
 
-    MAX_MESSAGES_PER_SPACE = 1000  # safety cap to prevent runaway pagination
+    MAX_MESSAGES_PER_SPACE = 1000
 
     messages = []
     page_token = None
@@ -356,11 +350,139 @@ def fetch_messages(_creds_json, space_name, start_date_str, end_date_str):
         if not page_token or len(messages) >= MAX_MESSAGES_PER_SPACE:
             break
 
-    # Keep only the most recent messages if we hit the cap
     messages = messages[:MAX_MESSAGES_PER_SPACE]
-    # Reverse so messages are in chronological order (oldest → newest)
     messages.reverse()
     return messages
+
+
+# ── Message Cache ────────────────────────────────────────────────────────────
+# Stores all fetched messages in session state, keyed by space.
+# The cache remembers its date boundaries and only fetches new/missing ranges.
+
+def _get_message_cache():
+    """Get or initialize the message cache in session state."""
+    if "message_cache" not in st.session_state:
+        st.session_state["message_cache"] = {}
+        # { space_name: { "messages": [...], "earliest": "YYYY-MM-DD", "latest": "YYYY-MM-DD" } }
+    return st.session_state["message_cache"]
+
+
+def _cache_last_refreshed():
+    """Return the timestamp of the last cache refresh."""
+    return st.session_state.get("cache_last_refreshed", None)
+
+
+def refresh_cache(creds_json, spaces, lookback_days=30):
+    """Pre-fetch last N days of messages for all spaces into the cache.
+
+    Called once on app startup and when the user clicks Refresh.
+    """
+    cache = _get_message_cache()
+    today = datetime.date.today()
+    start = today - datetime.timedelta(days=lookback_days)
+
+    for space in spaces:
+        display_name = space.get("displayName", space["name"])
+        space_id = space["name"]
+        try:
+            msgs = _fetch_messages_from_api(creds_json, space_id,
+                                            start.isoformat(), today.isoformat())
+            cache[display_name] = {
+                "messages": msgs,
+                "space_id": space_id,
+                "earliest": start.isoformat(),
+                "latest": today.isoformat(),
+            }
+        except Exception as e:
+            st.warning(f"Could not fetch messages from {display_name}: {e}")
+            if display_name not in cache:
+                cache[display_name] = {
+                    "messages": [],
+                    "space_id": space_id,
+                    "earliest": start.isoformat(),
+                    "latest": today.isoformat(),
+                }
+
+    st.session_state["cache_last_refreshed"] = datetime.datetime.now()
+    st.session_state["cache_lookback_days"] = lookback_days
+    return cache
+
+
+def get_messages_for_range(creds_json, spaces, start_str, end_str):
+    """Get messages for a date range, using cache when possible.
+
+    If the requested range is within the cached window, filters from cache.
+    If it extends beyond, fetches the missing range and merges.
+    """
+    cache = _get_message_cache()
+    result = {}
+
+    for space in spaces:
+        display_name = space.get("displayName", space["name"])
+        space_id = space["name"]
+        cached = cache.get(display_name, {})
+        cached_earliest = cached.get("earliest", "")
+        cached_latest = cached.get("latest", "")
+        cached_msgs = cached.get("messages", [])
+
+        req_start = datetime.date.fromisoformat(start_str)
+        req_end = datetime.date.fromisoformat(end_str)
+
+        # Case 1: Requested range is fully within cache
+        if cached_earliest and cached_latest:
+            cache_start = datetime.date.fromisoformat(cached_earliest)
+            cache_end = datetime.date.fromisoformat(cached_latest)
+
+            if req_start >= cache_start and req_end <= cache_end:
+                # Filter cached messages by date
+                filtered = [
+                    m for m in cached_msgs
+                    if _msg_in_range(m, start_str, end_str)
+                ]
+                result[display_name] = filtered
+                continue
+
+        # Case 2: Need to fetch (partially or fully outside cache)
+        try:
+            msgs = _fetch_messages_from_api(creds_json, space_id, start_str, end_str)
+            result[display_name] = msgs
+
+            # Merge into cache to grow the cached window
+            if cached_msgs:
+                all_msg_ids = {m.get("name") for m in cached_msgs}
+                new_msgs = [m for m in msgs if m.get("name") not in all_msg_ids]
+                merged = cached_msgs + new_msgs
+                merged.sort(key=lambda m: m.get("createTime", ""))
+                new_earliest = min(cached_earliest, start_str)
+                new_latest = max(cached_latest, end_str)
+            else:
+                merged = msgs
+                new_earliest = start_str
+                new_latest = end_str
+
+            cache[display_name] = {
+                "messages": merged,
+                "space_id": space_id,
+                "earliest": new_earliest,
+                "latest": new_latest,
+            }
+        except Exception as e:
+            st.warning(f"Could not fetch messages from {display_name}: {e}")
+            result[display_name] = []
+
+    return result
+
+
+def _msg_in_range(msg, start_str, end_str):
+    """Check if a message's createTime falls within the given date range."""
+    create_time = msg.get("createTime", "")
+    if not create_time:
+        return False
+    try:
+        msg_date = create_time[:10]  # "2026-03-17T..." → "2026-03-17"
+        return start_str <= msg_date <= end_str
+    except Exception:
+        return True  # include if we can't parse
 
 
 def get_sender_name(msg):
@@ -611,6 +733,17 @@ with st.sidebar:
     for s in TARGET_SPACES:
         st.markdown(f"- {s}")
 
+    # Cache status
+    _cr = _cache_last_refreshed()
+    if _cr:
+        cache = _get_message_cache()
+        total_cached = sum(len(v.get("messages", [])) for v in cache.values())
+        cache_range = st.session_state.get("cache_lookback_days", CACHE_LOOKBACK_DAYS)
+        st.divider()
+        st.markdown("**📦 Message Cache**")
+        st.caption(f"{total_cached} messages cached ({cache_range}d window)")
+        st.caption(f"Last refresh: {_cr.strftime('%I:%M %p')}")
+
     st.divider()
     if st.button("Clear Chat History", use_container_width=True):
         st.session_state["chat_messages"] = []
@@ -618,6 +751,8 @@ with st.sidebar:
 
     if st.button("Refresh Space Data", use_container_width=True):
         st.cache_data.clear()
+        st.session_state.pop("message_cache", None)
+        st.session_state.pop("cache_last_refreshed", None)
         st.rerun()
 
 
@@ -675,23 +810,27 @@ if not spaces:
             st.error(str(e))
     st.stop()
 
-# ── Default fetch (last 7 days — used for dashboard & initial chat context) ─
+# ── Message Cache (pre-fetch last 30 days, refresh hourly) ─────────────────
+CACHE_LOOKBACK_DAYS = 30
+_cache_refresh = _cache_last_refreshed()
+_needs_refresh = (
+    _cache_refresh is None
+    or (datetime.datetime.now() - _cache_refresh).total_seconds() > 3600  # 1 hour
+)
+
+if _needs_refresh:
+    with st.spinner("📦 Loading message cache (last 30 days)... this is a one-time load"):
+        refresh_cache(creds_json, spaces, lookback_days=CACHE_LOOKBACK_DAYS)
+
+# Get last 7 days from cache for dashboard display
 DEFAULT_LOOKBACK_DAYS = 7
 _today = datetime.date.today()
 _default_start = _today - datetime.timedelta(days=DEFAULT_LOOKBACK_DAYS)
 
-all_messages_by_space = {}
-total_msg_count = 0
-for space in spaces:
-    display_name = space.get("displayName", space["name"])
-    space_id = space["name"]
-    try:
-        msgs = fetch_messages(creds_json, space_id,
-                              _default_start.isoformat(), _today.isoformat())
-        all_messages_by_space[display_name] = msgs
-        total_msg_count += len(msgs)
-    except Exception as e:
-        st.warning(f"Could not fetch messages from {display_name}: {e}")
+all_messages_by_space = get_messages_for_range(
+    creds_json, spaces, _default_start.isoformat(), _today.isoformat()
+)
+total_msg_count = sum(len(v) for v in all_messages_by_space.values())
 
 # Build context for chatbot (default window)
 conversation_context = build_conversation_context(all_messages_by_space)
@@ -703,8 +842,10 @@ with mcol1:
     st.markdown(f'<div class="metric-card"><div class="metric-value">{len(spaces)}</div>'
                 f'<div class="metric-label">Spaces Connected</div></div>', unsafe_allow_html=True)
 with mcol2:
-    st.markdown(f'<div class="metric-card"><div class="metric-value">{total_msg_count}</div>'
-                f'<div class="metric-label">Messages (7d)</div></div>', unsafe_allow_html=True)
+    _cache = _get_message_cache()
+    _total_cached = sum(len(v.get("messages", [])) for v in _cache.values())
+    st.markdown(f'<div class="metric-card"><div class="metric-value">{_total_cached}</div>'
+                f'<div class="metric-label">Messages Cached (30d)</div></div>', unsafe_allow_html=True)
 with mcol3:
     now = datetime.datetime.now().strftime("%I:%M %p")
     st.markdown(f'<div class="metric-card"><div class="metric-value">{now}</div>'
@@ -768,17 +909,10 @@ with tab_chat:
                     if date_range:
                         q_start, q_end = date_range
                         date_label = f"{q_start} to {q_end}"
-                        with st.spinner(f"Fetching messages from {date_label}..."):
-                            # Fetch messages for the extracted date range
-                            q_messages_by_space = {}
-                            for space in spaces:
-                                dn = space.get("displayName", space["name"])
-                                sid = space["name"]
-                                try:
-                                    q_msgs = fetch_messages(creds_json, sid, q_start, q_end)
-                                    q_messages_by_space[dn] = q_msgs
-                                except Exception:
-                                    pass
+                        with st.spinner(f"Retrieving messages for {date_label}..."):
+                            q_messages_by_space = get_messages_for_range(
+                                creds_json, spaces, q_start, q_end
+                            )
                             chat_context = build_conversation_context(q_messages_by_space)
                             total_q = sum(len(v) for v in q_messages_by_space.values())
                         st.caption(f"📅 Searched {date_label} — {total_q} messages found")
