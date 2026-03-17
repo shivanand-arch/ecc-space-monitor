@@ -339,6 +339,8 @@ def fetch_messages(_creds_json, space_name, start_date_str, end_date_str):
     end_ts = f"{end_date_str}T23:59:59Z"
     api_filter = f'createTime > "{start_ts}" AND createTime < "{end_ts}"'
 
+    MAX_MESSAGES_PER_SPACE = 1000  # safety cap to prevent runaway pagination
+
     messages = []
     page_token = None
     while True:
@@ -351,9 +353,11 @@ def fetch_messages(_creds_json, space_name, start_date_str, end_date_str):
                 .execute())
         messages.extend(resp.get("messages", []))
         page_token = resp.get("nextPageToken")
-        if not page_token:
+        if not page_token or len(messages) >= MAX_MESSAGES_PER_SPACE:
             break
 
+    # Keep only the most recent messages if we hit the cap
+    messages = messages[:MAX_MESSAGES_PER_SPACE]
     # Reverse so messages are in chronological order (oldest → newest)
     messages.reverse()
     return messages
@@ -402,7 +406,14 @@ def extract_message_text(msg):
 
 
 def build_conversation_context(all_messages_by_space):
-    """Build a combined context string from all spaces for the chatbot."""
+    """Build a combined context string from all spaces for the chatbot.
+
+    Caps total output at ~500K characters (~125K tokens) to stay safely
+    within Claude's 200K-token context window after accounting for the
+    system prompt, user query, and response space.
+    """
+    MAX_CHARS = 500_000  # ~125K tokens (4 chars ≈ 1 token)
+    total_chars = 0
     parts = []
     for space_name, messages in all_messages_by_space.items():
         msg_lines = []
@@ -411,9 +422,18 @@ def build_conversation_context(all_messages_by_space):
             text = extract_message_text(m)
             time = format_time(m.get("createTime", ""))
             if text.strip():
-                msg_lines.append(f"[{time}] {sender}: {text}")
+                line = f"[{time}] {sender}: {text}"
+                if total_chars + len(line) > MAX_CHARS:
+                    msg_lines.append("[... truncated to fit context window ...]")
+                    break
+                msg_lines.append(line)
+                total_chars += len(line) + 1  # +1 for newline
         if msg_lines:
-            parts.append(f"\n=== SPACE: {space_name} ===\n" + "\n".join(msg_lines))
+            header = f"\n=== SPACE: {space_name} ===\n"
+            total_chars += len(header)
+            parts.append(header + "\n".join(msg_lines))
+        if total_chars >= MAX_CHARS:
+            break
     return "\n".join(parts)
 
 
@@ -422,13 +442,20 @@ def analyze_messages(messages, space_display_name, api_key):
     if not messages:
         return "No messages to analyze."
 
+    MAX_CHARS = 500_000
+    total_chars = 0
     msg_text = []
     for m in messages:
         sender = get_sender_name(m)
         text = extract_message_text(m)
         time = format_time(m.get("createTime", ""))
         if text.strip():
-            msg_text.append(f"[{time}] {sender}: {text}")
+            line = f"[{time}] {sender}: {text}"
+            if total_chars + len(line) > MAX_CHARS:
+                msg_text.append("[... truncated to fit context window ...]")
+                break
+            msg_text.append(line)
+            total_chars += len(line) + 1
 
     conversation = "\n".join(msg_text)
 
