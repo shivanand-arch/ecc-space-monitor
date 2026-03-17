@@ -324,20 +324,37 @@ def fetch_spaces(_creds_json):
 
 
 @st.cache_data(ttl=120)
-def fetch_messages(_creds_json, space_name, max_messages=200):
+def fetch_messages(_creds_json, space_name, start_date_str, end_date_str):
+    """Fetch messages from a space within a date range.
+
+    Uses the Chat API filter on createTime and orders newest-first so the
+    most recent context is always captured even for very active spaces.
+    """
     creds = Credentials.from_authorized_user_info(json.loads(_creds_json), SCOPES)
     service = build("chat", "v1", credentials=creds)
+
+    # Build RFC-3339 timestamps for the filter
+    start_ts = f"{start_date_str}T00:00:00Z"
+    end_ts = f"{end_date_str}T23:59:59Z"
+    api_filter = f'createTime > "{start_ts}" AND createTime < "{end_ts}"'
+
     messages = []
     page_token = None
-    while len(messages) < max_messages:
+    while True:
         resp = (service.spaces().messages()
-                .list(parent=space_name, pageSize=min(100, max_messages - len(messages)),
+                .list(parent=space_name,
+                      pageSize=100,
+                      filter=api_filter,
+                      orderBy="createTime desc",
                       pageToken=page_token)
                 .execute())
         messages.extend(resp.get("messages", []))
         page_token = resp.get("nextPageToken")
         if not page_token:
             break
+
+    # Reverse so messages are in chronological order (oldest → newest)
+    messages.reverse()
     return messages
 
 
@@ -435,6 +452,7 @@ Be specific - mention names, dates, and quote relevant messages when helpful.
 If asked about trends, patterns, or comparisons across spaces, analyze all available data.
 
 TODAY'S DATE: {datetime.datetime.now().strftime("%B %d, %Y")}
+MESSAGE WINDOW: {st.session_state.get('date_range_label', 'last 7 days')}
 
 AVAILABLE SPACE MESSAGES:
 {conversation_context}"""
@@ -490,7 +508,33 @@ with st.sidebar:
     else:
         api_key = st.text_input("Anthropic API Key", type="password")
 
-    msg_count = st.slider("Messages to fetch per space", 50, 500, 200, step=50)
+    # Date range filter
+    st.markdown("**Date Range**")
+    today = datetime.date.today()
+    max_range_days = 30
+    default_start = today - datetime.timedelta(days=7)
+
+    date_cols = st.columns(2)
+    with date_cols[0]:
+        start_date = st.date_input("From", value=default_start,
+                                    max_value=today,
+                                    min_value=today - datetime.timedelta(days=365))
+    with date_cols[1]:
+        end_date = st.date_input("To", value=today,
+                                  max_value=today,
+                                  min_value=today - datetime.timedelta(days=365))
+
+    # Enforce max duration
+    if (end_date - start_date).days > max_range_days:
+        st.warning(f"Max range is {max_range_days} days. Adjusting start date.")
+        start_date = end_date - datetime.timedelta(days=max_range_days)
+    if end_date < start_date:
+        st.error("End date must be after start date.")
+        st.stop()
+
+    date_range_label = f"{start_date.strftime('%b %d, %Y')} to {end_date.strftime('%b %d, %Y')} ({(end_date - start_date).days} days)"
+    st.session_state['date_range_label'] = date_range_label
+    st.caption(f"Fetching {(end_date - start_date).days} day(s) of messages")
 
     st.divider()
     st.markdown("**Target Spaces:**")
@@ -568,7 +612,8 @@ for space in spaces:
     display_name = space.get("displayName", space["name"])
     space_id = space["name"]
     try:
-        msgs = fetch_messages(creds_json, space_id, max_messages=msg_count)
+        msgs = fetch_messages(creds_json, space_id,
+                              start_date.isoformat(), end_date.isoformat())
         all_messages_by_space[display_name] = msgs
         total_msg_count += len(msgs)
     except Exception as e:
@@ -587,9 +632,9 @@ with mcol2:
     st.markdown(f'<div class="metric-card"><div class="metric-value">{total_msg_count}</div>'
                 f'<div class="metric-label">Total Messages</div></div>', unsafe_allow_html=True)
 with mcol3:
-    now = datetime.datetime.now().strftime("%I:%M %p")
-    st.markdown(f'<div class="metric-card"><div class="metric-value">{now}</div>'
-                f'<div class="metric-label">Last Refresh</div></div>', unsafe_allow_html=True)
+    days_span = (end_date - start_date).days
+    st.markdown(f'<div class="metric-card"><div class="metric-value">{days_span}d</div>'
+                f'<div class="metric-label">{start_date.strftime("%b %d")} → {end_date.strftime("%b %d")}</div></div>', unsafe_allow_html=True)
 with mcol4:
     st.markdown(f'<div class="metric-card"><div class="metric-value">Claude</div>'
                 f'<div class="metric-label">Analysis Engine</div></div>', unsafe_allow_html=True)
