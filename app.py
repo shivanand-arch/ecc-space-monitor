@@ -31,6 +31,8 @@ TOKEN_PATH = os.path.join(BASE_DIR, "token.json")
 CLIENT_SECRET_PATH = os.path.join(BASE_DIR, "client_secret.json")
 
 ALLOWED_DOMAIN = "exotel.com"
+CACHE_LOOKBACK_DAYS = 30
+DEFAULT_LOOKBACK_DAYS = 7
 
 # OAuth client for user login (from secrets or client_secret.json)
 def _get_login_client():
@@ -811,7 +813,6 @@ if not spaces:
     st.stop()
 
 # ── Message Cache (pre-fetch last 30 days, refresh hourly) ─────────────────
-CACHE_LOOKBACK_DAYS = 30
 _cache_refresh = _cache_last_refreshed()
 _needs_refresh = (
     _cache_refresh is None
@@ -823,7 +824,6 @@ if _needs_refresh:
         refresh_cache(creds_json, spaces, lookback_days=CACHE_LOOKBACK_DAYS)
 
 # Get last 7 days from cache for dashboard display
-DEFAULT_LOOKBACK_DAYS = 7
 _today = datetime.date.today()
 _default_start = _today - datetime.timedelta(days=DEFAULT_LOOKBACK_DAYS)
 
