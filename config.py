@@ -35,13 +35,12 @@ TARGET_SPACE_NAMES = [
 ALLOWED_DOMAIN = "exotel.com"
 
 # ── Message fetching ─────────────────────────────────────────────────────────
-MAX_MESSAGES_PER_SPACE = 1000      # safety cap per API pagination run
+MAX_MESSAGES_PER_SPACE = 50_000    # safety cap per API pagination run
 MAX_CONTEXT_CHARS = 500_000        # ~125K tokens sent to Claude
 
 # ── Cache ────────────────────────────────────────────────────────────────────
-CACHE_LOOKBACK_DAYS = 30           # pre-fetch window on startup
-DEFAULT_LOOKBACK_DAYS = 7          # dashboard default view
 CACHE_TTL_SECONDS = 3600           # auto-refresh interval (1 hour)
+DEFAULT_DASHBOARD_DAYS = 7         # default for dashboard Recent Messages panel
 
 # ── Chat history ─────────────────────────────────────────────────────────────
 MAX_CHAT_HISTORY_MESSAGES = 20     # keep last 20 messages (10 exchanges)

@@ -4,7 +4,7 @@ ECC Space Monitor — main Streamlit app.
 Thin UI layer; business logic lives in:
   config.py        — constants
   login.py         — Google OAuth login gate
-  chat_api.py      — Chat API client + message cache
+  chat_api.py      — Chat API client + full message repository
   llm_client.py    — Claude analysis & Q&A
   message_utils.py — text extraction, context building, HTML escaping
   date_parser.py   — deterministic date-range extraction
@@ -17,9 +17,8 @@ import streamlit as st
 
 from config import (
     BASE_DIR,
-    CACHE_LOOKBACK_DAYS,
     CLIENT_SECRET_PATH,
-    DEFAULT_LOOKBACK_DAYS,
+    DEFAULT_DASHBOARD_DAYS,
     TARGET_SPACE_NAMES,
     TOKEN_PATH,
     MAX_CHAT_HISTORY_MESSAGES,
@@ -28,10 +27,12 @@ from login import check_google_auth
 from chat_api import (
     get_credentials,
     fetch_spaces,
-    refresh_cache,
-    cache_needs_refresh,
-    cache_last_refreshed,
+    load_full_repository,
+    repo_needs_refresh,
+    repo_last_refreshed,
+    get_all_messages,
     get_messages_for_range,
+    get_repo_stats,
 )
 from message_utils import (
     get_sender_name,
@@ -100,7 +101,6 @@ with st.sidebar:
     user_email = safe(st.session_state.get("authenticated_email", ""))
     user_pic = st.session_state.get("user_picture", "")
     if user_pic:
-        # Profile picture comes from Google — URL is trustworthy but we escape text
         st.markdown(
             f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">'
             f'<img src="{safe(user_pic)}" style="width:32px;height:32px;border-radius:50%;">'
@@ -135,41 +135,20 @@ with st.sidebar:
         api_key = st.text_input("Anthropic API Key", type="password")
 
     st.divider()
-
-    # Duration filter
-    DURATION_OPTIONS = {
-        "Last 7 days": 7,
-        "Last 14 days": 14,
-        "Last 30 days": 30,
-        "Last 60 days": 60,
-        "Last 90 days": 90,
-        "Last 6 months": 180,
-        "Last 1 year": 365,
-    }
-    selected_duration = st.selectbox(
-        "📅 Dashboard Duration",
-        options=list(DURATION_OPTIONS.keys()),
-        index=0,
-        key="duration_selector",
-    )
-    dashboard_lookback_days = DURATION_OPTIONS[selected_duration]
-
-    st.divider()
     st.markdown("**Target Spaces:**")
     for s in TARGET_SPACE_NAMES:
         st.markdown(f"- {s}")
 
-    # Cache status
-    _cr = cache_last_refreshed()
-    if _cr:
-        from chat_api import _get_cache
-        _cache = _get_cache()
-        total_cached = sum(len(v.get("messages", [])) for v in _cache.values())
-        cache_range = st.session_state.get("cache_lookback_days", CACHE_LOOKBACK_DAYS)
+    # Repository status
+    _rr = repo_last_refreshed()
+    if _rr:
+        stats = get_repo_stats()
         st.divider()
-        st.markdown("**Message Cache**")
-        st.caption(f"{total_cached} messages cached ({cache_range}d window)")
-        st.caption(f"Last refresh: {_cr.strftime('%I:%M %p')}")
+        st.markdown("**Message Repository**")
+        st.caption(f"{stats['total']:,} total messages")
+        if stats["earliest"] and stats["latest"]:
+            st.caption(f"Coverage: {stats['earliest']} to {stats['latest']}")
+        st.caption(f"Last refresh: {_rr.strftime('%I:%M %p')}")
 
     st.divider()
     if st.button("Clear Chat History", use_container_width=True):
@@ -178,14 +157,14 @@ with st.sidebar:
 
     if st.button("Refresh Space Data", use_container_width=True):
         st.cache_data.clear()
-        st.session_state.pop("message_cache", None)
-        st.session_state.pop("cache_last_refreshed", None)
+        st.session_state.pop("message_repo", None)
+        st.session_state.pop("repo_last_refreshed", None)
         st.rerun()
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 st.markdown("# ECC Space Monitor")
-st.caption("Real-time monitoring, AI analysis, and Q&A for Google Chat spaces")
+st.caption("Full message repository with AI-powered search and analysis")
 
 # Chat API credentials
 creds = get_credentials()
@@ -239,28 +218,22 @@ if not spaces:
             st.error(str(e))
     st.stop()
 
-# ── Populate cache ───────────────────────────────────────────────────────────
-# Cache enough days for the selected duration (re-fetch if user picks longer window)
-_needed_days = dashboard_lookback_days
-_cached_days = st.session_state.get("cached_lookback_days", 0)
+# ── Load full message repository ─────────────────────────────────────────────
+if repo_needs_refresh():
+    progress_bar = st.progress(0, text="Loading full message repository (one-time)...")
+    load_full_repository(creds_json, spaces, progress_callback=progress_bar.progress)
+    progress_bar.empty()
 
-if cache_needs_refresh() or _needed_days > _cached_days:
-    with st.spinner(f"Loading messages ({selected_duration})..."):
-        refresh_cache(creds_json, spaces, lookback_days=_needed_days)
-        st.session_state["cached_lookback_days"] = _needed_days
-
-# Dashboard: use the duration selected in sidebar dropdown
-_today = datetime.date.today()
-_dashboard_start = _today - datetime.timedelta(days=dashboard_lookback_days)
-
-all_messages_by_space = get_messages_for_range(
-    creds_json, spaces, _dashboard_start.isoformat(), _today.isoformat()
-)
+# Get all messages (full history) and a recent slice for the dashboard
+all_messages_by_space = get_all_messages()
 total_msg_count = sum(len(v) for v in all_messages_by_space.values())
+
+# For the default conversation context (chat), use all messages
 conversation_context = build_conversation_context(all_messages_by_space)
 
 # ── Metrics row ──────────────────────────────────────────────────────────────
 st.markdown("---")
+stats = get_repo_stats()
 mcol1, mcol2, mcol3, mcol4 = st.columns(4)
 with mcol1:
     st.markdown(
@@ -269,18 +242,18 @@ with mcol1:
         unsafe_allow_html=True,
     )
 with mcol2:
-    from chat_api import _get_cache as _gc
-    _total_cached = sum(len(v.get("messages", [])) for v in _gc().values())
     st.markdown(
-        f'<div class="metric-card"><div class="metric-value">{total_msg_count}</div>'
-        f'<div class="metric-label">Messages ({selected_duration})</div></div>',
+        f'<div class="metric-card"><div class="metric-value">{total_msg_count:,}</div>'
+        f'<div class="metric-label">Total Messages</div></div>',
         unsafe_allow_html=True,
     )
 with mcol3:
-    now = datetime.datetime.now().strftime("%I:%M %p")
+    coverage = "N/A"
+    if stats["earliest"]:
+        coverage = f'{stats["earliest"]}'
     st.markdown(
-        f'<div class="metric-card"><div class="metric-value">{now}</div>'
-        f'<div class="metric-label">Last Refresh</div></div>',
+        f'<div class="metric-card"><div class="metric-value">{coverage}</div>'
+        f'<div class="metric-label">Data Since</div></div>',
         unsafe_allow_html=True,
     )
 with mcol4:
@@ -301,20 +274,23 @@ tab_chat, tab_dashboard = st.tabs(["Ask Anything", "Space Dashboard"])
 # ── TAB 1: CHAT ──────────────────────────────────────────────────────────────
 with tab_chat:
     st.markdown("### Ask anything about your spaces")
-    st.caption("Ask questions, request analysis, compare spaces, find action items, track issues...")
+    st.caption(
+        f"Full repository: {total_msg_count:,} messages"
+        + (f" from {stats['earliest']}" if stats["earliest"] else "")
+        + ". Ask about any time period."
+    )
 
     with st.expander("Example questions you can ask"):
         st.markdown("""
 - What are the top issues raised across all spaces today?
-- Who has the most action items pending?
+- What happened with Central Registrar issues in the last 2 weeks?
 - Summarize what happened in Panic Room this week
-- Are there any customer escalations that haven't been resolved?
+- Show me all customer escalations from January 2024
 - Compare the activity level between DRI's Huddle and ECC Panic Room
 - What decisions were made in the last 24 hours?
-- Is anyone blocked or waiting on something?
-- What's the overall team sentiment across spaces?
-- List all mentions of [customer name / topic]
-- Give me an executive briefing for all spaces
+- List all mentions of [customer name / topic] ever
+- Give me an executive briefing for the past month
+- What were the major incidents in Q4 2025?
         """)
 
     if "chat_messages" not in st.session_state:
@@ -346,16 +322,15 @@ with tab_chat:
                     if date_range:
                         q_start, q_end = date_range
                         date_label = f"{q_start} to {q_end}"
-                        with st.spinner(f"Retrieving messages for {date_label}..."):
-                            q_messages_by_space = get_messages_for_range(
-                                creds_json, spaces, q_start, q_end
-                            )
+                        with st.spinner(f"Filtering messages for {date_label}..."):
+                            q_messages_by_space = get_messages_for_range(q_start, q_end)
                             chat_context = build_conversation_context(q_messages_by_space)
                             total_q = sum(len(v) for v in q_messages_by_space.values())
-                        st.caption(f"Searched {date_label} — {total_q} messages found")
+                        st.caption(f"📅 {date_label} — {total_q:,} messages")
                     else:
+                        # No date specified — search across ALL messages
                         chat_context = conversation_context
-                        date_label = selected_duration
+                        date_label = f"Full history ({stats['earliest']} to {stats['latest']})"
 
                     # Step 3: Answer
                     with st.spinner("Analyzing..."):
@@ -399,7 +374,7 @@ with tab_dashboard:
             st.markdown(
                 f'<div class="space-card">'
                 f'<h3>{safe(display_name)}</h3>'
-                f'<p>{len(messages)} messages fetched | Space ID: <code>{safe(space_id)}</code></p>'
+                f'<p>{len(messages):,} total messages | Space ID: <code>{safe(space_id)}</code></p>'
                 f'</div>',
                 unsafe_allow_html=True,
             )

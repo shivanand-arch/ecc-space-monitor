@@ -1,8 +1,10 @@
 """
-Google Chat API client — space discovery, message fetching, and message cache.
+Google Chat API client — space discovery, message fetching, and full message repository.
 
-The cache stores all previously-fetched messages in ``st.session_state`` so
-repeated queries within the cached date window are instant.
+On first load the app fetches ALL messages from every monitored space (full
+history).  The repository is stored in ``st.session_state`` and refreshed
+hourly to pick up new messages.  Date filtering happens in-memory on the
+already-cached dataset — no repeated API calls.
 """
 
 import datetime
@@ -17,7 +19,6 @@ from googleapiclient.discovery import build
 from config import (
     CHAT_SCOPES,
     MAX_MESSAGES_PER_SPACE,
-    CACHE_LOOKBACK_DAYS,
     CACHE_TTL_SECONDS,
     TOKEN_PATH,
     CLIENT_SECRET_PATH,
@@ -31,7 +32,7 @@ logger = logging.getLogger(__name__)
 # ── Credential helpers ───────────────────────────────────────────────────────
 
 def get_credentials() -> Credentials | None:
-    """Resolve Google OAuth credentials from session → file → secrets."""
+    """Resolve Google OAuth credentials from session -> file -> secrets."""
 
     # 1. Session state (already authenticated this session)
     if "google_creds" in st.session_state:
@@ -137,22 +138,44 @@ def fetch_spaces(_creds_json: str) -> list[dict]:
     return matched
 
 
-def fetch_messages_from_api(
-    creds_json: str,
-    space_name: str,
-    start_date: str,
-    end_date: str,
-) -> list[dict]:
-    """Fetch messages from *space_name* between *start_date* and *end_date*.
+def _fetch_all_messages(creds_json: str, space_name: str) -> list[dict]:
+    """Fetch ALL messages from a space. No date filter. Paginate until done.
 
-    Paginates up to ``MAX_MESSAGES_PER_SPACE`` messages; newest first so
-    the most recent context is always captured.
+    Returns messages in chronological order (oldest first).
     """
     service = _build_service(creds_json)
+    messages: list[dict] = []
+    page_token = None
 
-    start_ts = f"{start_date}T00:00:00Z"
-    end_ts = f"{end_date}T23:59:59Z"
-    api_filter = f'createTime > "{start_ts}" AND createTime < "{end_ts}"'
+    while True:
+        resp = (
+            service.spaces()
+            .messages()
+            .list(
+                parent=space_name,
+                pageSize=1000,
+                pageToken=page_token,
+            )
+            .execute()
+        )
+        batch = resp.get("messages", [])
+        messages.extend(batch)
+        page_token = resp.get("nextPageToken")
+        if not page_token or len(messages) >= MAX_MESSAGES_PER_SPACE:
+            break
+
+    # API returns newest-first by default; sort chronologically
+    messages.sort(key=lambda m: m.get("createTime", ""))
+    return messages
+
+
+def _fetch_messages_since(creds_json: str, space_name: str, since: str) -> list[dict]:
+    """Fetch only messages newer than *since* (ISO date string).
+
+    Used for incremental refresh so we don't re-fetch the entire history.
+    """
+    service = _build_service(creds_json)
+    api_filter = f'createTime > "{since}T00:00:00Z"'
 
     messages: list[dict] = []
     page_token = None
@@ -162,139 +185,128 @@ def fetch_messages_from_api(
             .messages()
             .list(
                 parent=space_name,
-                pageSize=100,
+                pageSize=1000,
                 filter=api_filter,
-                orderBy="createTime desc",
                 pageToken=page_token,
             )
             .execute()
         )
         messages.extend(resp.get("messages", []))
         page_token = resp.get("nextPageToken")
-        if not page_token or len(messages) >= MAX_MESSAGES_PER_SPACE:
+        if not page_token:
             break
 
-    messages = messages[:MAX_MESSAGES_PER_SPACE]
-    messages.reverse()  # chronological order
+    messages.sort(key=lambda m: m.get("createTime", ""))
     return messages
 
 
-# ── Session-state message cache ──────────────────────────────────────────────
+# ── Full message repository (session-state backed) ──────────────────────────
 
-def _get_cache() -> dict:
-    if "message_cache" not in st.session_state:
-        st.session_state["message_cache"] = {}
-    return st.session_state["message_cache"]
-
-
-def cache_last_refreshed() -> datetime.datetime | None:
-    return st.session_state.get("cache_last_refreshed")
+def _get_repo() -> dict:
+    """Get the message repository from session state."""
+    if "message_repo" not in st.session_state:
+        st.session_state["message_repo"] = {}
+    return st.session_state["message_repo"]
 
 
-def cache_needs_refresh() -> bool:
-    ts = cache_last_refreshed()
+def repo_last_refreshed() -> datetime.datetime | None:
+    return st.session_state.get("repo_last_refreshed")
+
+
+def repo_needs_refresh() -> bool:
+    ts = repo_last_refreshed()
     if ts is None:
         return True
     return (datetime.datetime.now() - ts).total_seconds() > CACHE_TTL_SECONDS
 
 
-def refresh_cache(creds_json: str, spaces: list[dict], lookback_days: int = CACHE_LOOKBACK_DAYS):
-    """Pre-populate the cache with the last *lookback_days* of messages."""
-    cache = _get_cache()
-    today = datetime.date.today()
-    start = today - datetime.timedelta(days=lookback_days)
+def load_full_repository(creds_json: str, spaces: list[dict], progress_callback=None):
+    """Fetch ALL messages from all spaces and store in the repository.
 
-    for space in spaces:
+    First load fetches everything; subsequent refreshes only fetch new
+    messages since the last known message.
+    """
+    repo = _get_repo()
+
+    for i, space in enumerate(spaces):
         display_name = space.get("displayName", space["name"])
         space_id = space["name"]
+        existing = repo.get(display_name, {})
+        existing_msgs = existing.get("messages", [])
+
         try:
-            msgs = fetch_messages_from_api(creds_json, space_id,
-                                           start.isoformat(), today.isoformat())
-            cache[display_name] = {
-                "messages": msgs,
+            if existing_msgs:
+                # Incremental: fetch only new messages since last known
+                last_time = existing_msgs[-1].get("createTime", "")[:10]
+                new_msgs = _fetch_messages_since(creds_json, space_id, last_time)
+                # Deduplicate by message ID
+                existing_ids = {m.get("name") for m in existing_msgs}
+                truly_new = [m for m in new_msgs if m.get("name") not in existing_ids]
+                all_msgs = existing_msgs + truly_new
+                all_msgs.sort(key=lambda m: m.get("createTime", ""))
+            else:
+                # First load: fetch everything
+                all_msgs = _fetch_all_messages(creds_json, space_id)
+
+            repo[display_name] = {
+                "messages": all_msgs,
                 "space_id": space_id,
-                "earliest": start.isoformat(),
-                "latest": today.isoformat(),
             }
         except Exception as exc:
-            logger.warning("Cache refresh failed for %s: %s", display_name, exc)
+            logger.warning("Repository load failed for %s: %s", display_name, exc)
             st.warning(f"Could not fetch messages from {display_name}: {exc}")
-            if display_name not in cache:
-                cache[display_name] = {
-                    "messages": [],
-                    "space_id": space_id,
-                    "earliest": start.isoformat(),
-                    "latest": today.isoformat(),
-                }
+            if display_name not in repo:
+                repo[display_name] = {"messages": [], "space_id": space_id}
 
-    st.session_state["cache_last_refreshed"] = datetime.datetime.now()
-    st.session_state["cache_lookback_days"] = lookback_days
-    return cache
+        if progress_callback:
+            progress_callback((i + 1) / len(spaces))
+
+    st.session_state["repo_last_refreshed"] = datetime.datetime.now()
+    return repo
 
 
-def get_messages_for_range(
-    creds_json: str,
-    spaces: list[dict],
-    start_str: str,
-    end_str: str,
-) -> dict[str, list[dict]]:
-    """Return messages per-space for the requested date range.
+def get_all_messages() -> dict[str, list[dict]]:
+    """Return the full repository: {display_name: [messages]}."""
+    repo = _get_repo()
+    return {name: data.get("messages", []) for name, data in repo.items()}
 
-    Serves from cache when possible; fetches and merges otherwise.
+
+def get_messages_for_range(start_str: str, end_str: str) -> dict[str, list[dict]]:
+    """Filter the repository to messages within [start_str, end_str].
+
+    No API calls — purely in-memory filtering.
     """
-    cache = _get_cache()
+    repo = _get_repo()
     result: dict[str, list[dict]] = {}
 
-    for space in spaces:
-        display_name = space.get("displayName", space["name"])
-        space_id = space["name"]
-        cached = cache.get(display_name, {})
-        cached_earliest = cached.get("earliest", "")
-        cached_latest = cached.get("latest", "")
-        cached_msgs = cached.get("messages", [])
-
-        req_start = datetime.date.fromisoformat(start_str)
-        req_end = datetime.date.fromisoformat(end_str)
-
-        # Fully within cache — filter in memory
-        if cached_earliest and cached_latest:
-            cache_start = datetime.date.fromisoformat(cached_earliest)
-            cache_end = datetime.date.fromisoformat(cached_latest)
-            if req_start >= cache_start and req_end <= cache_end:
-                result[display_name] = [
-                    m for m in cached_msgs if _msg_in_range(m, start_str, end_str)
-                ]
-                continue
-
-        # Outside cache — live fetch + merge
-        try:
-            msgs = fetch_messages_from_api(creds_json, space_id, start_str, end_str)
-            result[display_name] = msgs
-
-            if cached_msgs:
-                existing_ids = {m.get("name") for m in cached_msgs}
-                new_msgs = [m for m in msgs if m.get("name") not in existing_ids]
-                merged = cached_msgs + new_msgs
-                merged.sort(key=lambda m: m.get("createTime", ""))
-                new_earliest = min(cached_earliest, start_str)
-                new_latest = max(cached_latest, end_str)
-            else:
-                merged = msgs
-                new_earliest = start_str
-                new_latest = end_str
-
-            cache[display_name] = {
-                "messages": merged,
-                "space_id": space_id,
-                "earliest": new_earliest,
-                "latest": new_latest,
-            }
-        except Exception as exc:
-            logger.warning("Fetch failed for %s: %s", display_name, exc)
-            st.warning(f"Could not fetch messages from {display_name}: {exc}")
-            result[display_name] = []
+    for name, data in repo.items():
+        result[name] = [
+            m for m in data.get("messages", [])
+            if _msg_in_range(m, start_str, end_str)
+        ]
 
     return result
+
+
+def get_repo_stats() -> dict:
+    """Return summary stats about the repository."""
+    repo = _get_repo()
+    total = 0
+    earliest = None
+    latest = None
+
+    for data in repo.values():
+        msgs = data.get("messages", [])
+        total += len(msgs)
+        for m in msgs:
+            ct = m.get("createTime", "")[:10]
+            if ct:
+                if earliest is None or ct < earliest:
+                    earliest = ct
+                if latest is None or ct > latest:
+                    latest = ct
+
+    return {"total": total, "earliest": earliest, "latest": latest}
 
 
 def _msg_in_range(msg: dict, start_str: str, end_str: str) -> bool:
