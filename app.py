@@ -143,6 +143,8 @@ with st.sidebar:
         "Last 30 days": 30,
         "Last 60 days": 60,
         "Last 90 days": 90,
+        "Last 6 months": 180,
+        "Last 1 year": 365,
     }
     selected_duration = st.selectbox(
         "📅 Dashboard Duration",
@@ -238,10 +240,14 @@ if not spaces:
     st.stop()
 
 # ── Populate cache ───────────────────────────────────────────────────────────
-_max_cache_days = max(90, CACHE_LOOKBACK_DAYS)
-if cache_needs_refresh():
-    with st.spinner(f"Loading message cache (last {_max_cache_days} days)... one-time load"):
-        refresh_cache(creds_json, spaces, lookback_days=_max_cache_days)
+# Cache enough days for the selected duration (re-fetch if user picks longer window)
+_needed_days = dashboard_lookback_days
+_cached_days = st.session_state.get("cached_lookback_days", 0)
+
+if cache_needs_refresh() or _needed_days > _cached_days:
+    with st.spinner(f"Loading messages ({selected_duration})..."):
+        refresh_cache(creds_json, spaces, lookback_days=_needed_days)
+        st.session_state["cached_lookback_days"] = _needed_days
 
 # Dashboard: use the duration selected in sidebar dropdown
 _today = datetime.date.today()
