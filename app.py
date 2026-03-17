@@ -442,7 +442,48 @@ MESSAGES:
     return response.content[0].text
 
 
-def chat_with_claude(user_question, conversation_context, chat_history, api_key):
+def extract_date_range(user_question, api_key):
+    """Use Claude to extract a date range from the user's question.
+
+    Returns (start_date_str, end_date_str) in YYYY-MM-DD format,
+    or None if no specific date range is mentioned (use default).
+    """
+    today = datetime.date.today()
+    client = anthropic.Anthropic(api_key=api_key)
+    response = client.messages.create(
+        model="claude-sonnet-4-5-20250929",
+        max_tokens=200,
+        temperature=0,
+        messages=[{
+            "role": "user",
+            "content": f"""Today is {today.isoformat()} ({today.strftime("%A")}).
+
+Extract the date range from this question. If no specific time period is mentioned, reply ONLY with "DEFAULT".
+If a date range is mentioned (e.g. "last week", "past month", "in January", "last 3 days", "yesterday", "since March 1"), reply ONLY with two dates in this exact format:
+START=YYYY-MM-DD
+END=YYYY-MM-DD
+
+Cap the range at 60 days maximum. If the user says "all time" or something very broad, use the last 60 days.
+
+Question: {user_question}"""
+        }]
+    )
+    text = response.content[0].text.strip()
+    if text == "DEFAULT":
+        return None
+    try:
+        lines = text.strip().split("\n")
+        start_str = lines[0].split("=")[1].strip()
+        end_str = lines[1].split("=")[1].strip()
+        # Validate dates
+        datetime.date.fromisoformat(start_str)
+        datetime.date.fromisoformat(end_str)
+        return start_str, end_str
+    except Exception:
+        return None
+
+
+def chat_with_claude(user_question, conversation_context, date_label, chat_history, api_key):
     """Send a question to Claude with full space context and chat history."""
     client = anthropic.Anthropic(api_key=api_key)
 
@@ -452,7 +493,7 @@ Be specific - mention names, dates, and quote relevant messages when helpful.
 If asked about trends, patterns, or comparisons across spaces, analyze all available data.
 
 TODAY'S DATE: {datetime.datetime.now().strftime("%B %d, %Y")}
-MESSAGE WINDOW: {st.session_state.get('date_range_label', 'last 7 days')}
+MESSAGE WINDOW: {date_label}
 
 AVAILABLE SPACE MESSAGES:
 {conversation_context}"""
@@ -507,34 +548,6 @@ with st.sidebar:
         st.success("API Key loaded")
     else:
         api_key = st.text_input("Anthropic API Key", type="password")
-
-    # Date range filter
-    st.markdown("**Date Range**")
-    today = datetime.date.today()
-    max_range_days = 30
-    default_start = today - datetime.timedelta(days=7)
-
-    date_cols = st.columns(2)
-    with date_cols[0]:
-        start_date = st.date_input("From", value=default_start,
-                                    max_value=today,
-                                    min_value=today - datetime.timedelta(days=365))
-    with date_cols[1]:
-        end_date = st.date_input("To", value=today,
-                                  max_value=today,
-                                  min_value=today - datetime.timedelta(days=365))
-
-    # Enforce max duration
-    if (end_date - start_date).days > max_range_days:
-        st.warning(f"Max range is {max_range_days} days. Adjusting start date.")
-        start_date = end_date - datetime.timedelta(days=max_range_days)
-    if end_date < start_date:
-        st.error("End date must be after start date.")
-        st.stop()
-
-    date_range_label = f"{start_date.strftime('%b %d, %Y')} to {end_date.strftime('%b %d, %Y')} ({(end_date - start_date).days} days)"
-    st.session_state['date_range_label'] = date_range_label
-    st.caption(f"Fetching {(end_date - start_date).days} day(s) of messages")
 
     st.divider()
     st.markdown("**Target Spaces:**")
@@ -605,7 +618,11 @@ if not spaces:
             st.error(str(e))
     st.stop()
 
-# ── Fetch all messages ──────────────────────────────────────────────────────
+# ── Default fetch (last 7 days — used for dashboard & initial chat context) ─
+DEFAULT_LOOKBACK_DAYS = 7
+_today = datetime.date.today()
+_default_start = _today - datetime.timedelta(days=DEFAULT_LOOKBACK_DAYS)
+
 all_messages_by_space = {}
 total_msg_count = 0
 for space in spaces:
@@ -613,13 +630,13 @@ for space in spaces:
     space_id = space["name"]
     try:
         msgs = fetch_messages(creds_json, space_id,
-                              start_date.isoformat(), end_date.isoformat())
+                              _default_start.isoformat(), _today.isoformat())
         all_messages_by_space[display_name] = msgs
         total_msg_count += len(msgs)
     except Exception as e:
         st.warning(f"Could not fetch messages from {display_name}: {e}")
 
-# Build context for chatbot
+# Build context for chatbot (default window)
 conversation_context = build_conversation_context(all_messages_by_space)
 
 # ── Metrics row ─────────────────────────────────────────────────────────────
@@ -630,11 +647,11 @@ with mcol1:
                 f'<div class="metric-label">Spaces Connected</div></div>', unsafe_allow_html=True)
 with mcol2:
     st.markdown(f'<div class="metric-card"><div class="metric-value">{total_msg_count}</div>'
-                f'<div class="metric-label">Total Messages</div></div>', unsafe_allow_html=True)
+                f'<div class="metric-label">Messages (7d)</div></div>', unsafe_allow_html=True)
 with mcol3:
-    days_span = (end_date - start_date).days
-    st.markdown(f'<div class="metric-card"><div class="metric-value">{days_span}d</div>'
-                f'<div class="metric-label">{start_date.strftime("%b %d")} → {end_date.strftime("%b %d")}</div></div>', unsafe_allow_html=True)
+    now = datetime.datetime.now().strftime("%I:%M %p")
+    st.markdown(f'<div class="metric-card"><div class="metric-value">{now}</div>'
+                f'<div class="metric-label">Last Refresh</div></div>', unsafe_allow_html=True)
 with mcol4:
     st.markdown(f'<div class="metric-card"><div class="metric-value">Claude</div>'
                 f'<div class="metric-label">Analysis Engine</div></div>', unsafe_allow_html=True)
@@ -686,20 +703,48 @@ with tab_chat:
 
             # Get Claude response
             with st.chat_message("assistant"):
-                with st.spinner("Analyzing spaces..."):
-                    try:
+                try:
+                    # Step 1: Extract date range from the query
+                    with st.spinner("Understanding your question..."):
+                        date_range = extract_date_range(prompt, api_key)
+
+                    if date_range:
+                        q_start, q_end = date_range
+                        date_label = f"{q_start} to {q_end}"
+                        with st.spinner(f"Fetching messages from {date_label}..."):
+                            # Fetch messages for the extracted date range
+                            q_messages_by_space = {}
+                            for space in spaces:
+                                dn = space.get("displayName", space["name"])
+                                sid = space["name"]
+                                try:
+                                    q_msgs = fetch_messages(creds_json, sid, q_start, q_end)
+                                    q_messages_by_space[dn] = q_msgs
+                                except Exception:
+                                    pass
+                            chat_context = build_conversation_context(q_messages_by_space)
+                            total_q = sum(len(v) for v in q_messages_by_space.values())
+                        st.caption(f"📅 Searched {date_label} — {total_q} messages found")
+                    else:
+                        # Use default 7-day context
+                        chat_context = conversation_context
+                        date_label = f"Last {DEFAULT_LOOKBACK_DAYS} days"
+
+                    # Step 2: Answer the question
+                    with st.spinner("Analyzing..."):
                         response = chat_with_claude(
                             prompt,
-                            conversation_context,
-                            st.session_state["chat_messages"][:-1],  # exclude current msg
+                            chat_context,
+                            date_label,
+                            st.session_state["chat_messages"][:-1],
                             api_key
                         )
                         st.markdown(response)
                         st.session_state["chat_messages"].append(
                             {"role": "assistant", "content": response}
                         )
-                    except Exception as e:
-                        st.error(f"Error: {e}")
+                except Exception as e:
+                    st.error(f"Error: {e}")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 2: SPACE DASHBOARD
