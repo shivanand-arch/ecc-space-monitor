@@ -135,6 +135,24 @@ with st.sidebar:
         api_key = st.text_input("Anthropic API Key", type="password")
 
     st.divider()
+
+    # Duration filter
+    DURATION_OPTIONS = {
+        "Last 7 days": 7,
+        "Last 14 days": 14,
+        "Last 30 days": 30,
+        "Last 60 days": 60,
+        "Last 90 days": 90,
+    }
+    selected_duration = st.selectbox(
+        "📅 Dashboard Duration",
+        options=list(DURATION_OPTIONS.keys()),
+        index=0,
+        key="duration_selector",
+    )
+    dashboard_lookback_days = DURATION_OPTIONS[selected_duration]
+
+    st.divider()
     st.markdown("**Target Spaces:**")
     for s in TARGET_SPACE_NAMES:
         st.markdown(f"- {s}")
@@ -220,16 +238,17 @@ if not spaces:
     st.stop()
 
 # ── Populate cache ───────────────────────────────────────────────────────────
+_max_cache_days = max(90, CACHE_LOOKBACK_DAYS)
 if cache_needs_refresh():
-    with st.spinner("Loading message cache (last 30 days)... one-time load"):
-        refresh_cache(creds_json, spaces, lookback_days=CACHE_LOOKBACK_DAYS)
+    with st.spinner(f"Loading message cache (last {_max_cache_days} days)... one-time load"):
+        refresh_cache(creds_json, spaces, lookback_days=_max_cache_days)
 
-# Dashboard default: last 7 days from cache
+# Dashboard: use the duration selected in sidebar dropdown
 _today = datetime.date.today()
-_default_start = _today - datetime.timedelta(days=DEFAULT_LOOKBACK_DAYS)
+_dashboard_start = _today - datetime.timedelta(days=dashboard_lookback_days)
 
 all_messages_by_space = get_messages_for_range(
-    creds_json, spaces, _default_start.isoformat(), _today.isoformat()
+    creds_json, spaces, _dashboard_start.isoformat(), _today.isoformat()
 )
 total_msg_count = sum(len(v) for v in all_messages_by_space.values())
 conversation_context = build_conversation_context(all_messages_by_space)
@@ -247,8 +266,8 @@ with mcol2:
     from chat_api import _get_cache as _gc
     _total_cached = sum(len(v.get("messages", [])) for v in _gc().values())
     st.markdown(
-        f'<div class="metric-card"><div class="metric-value">{_total_cached}</div>'
-        f'<div class="metric-label">Messages Cached (30d)</div></div>',
+        f'<div class="metric-card"><div class="metric-value">{total_msg_count}</div>'
+        f'<div class="metric-label">Messages ({selected_duration})</div></div>',
         unsafe_allow_html=True,
     )
 with mcol3:
@@ -330,7 +349,7 @@ with tab_chat:
                         st.caption(f"Searched {date_label} — {total_q} messages found")
                     else:
                         chat_context = conversation_context
-                        date_label = f"Last {DEFAULT_LOOKBACK_DAYS} days"
+                        date_label = selected_duration
 
                     # Step 3: Answer
                     with st.spinner("Analyzing..."):
