@@ -1,199 +1,60 @@
-import streamlit as st
-import json
-import os
-import re
+"""
+ECC Space Monitor — main Streamlit app.
+
+Thin UI layer; business logic lives in:
+  config.py        — constants
+  login.py         — Google OAuth login gate
+  chat_api.py      — Chat API client + message cache
+  llm_client.py    — Claude analysis & Q&A
+  message_utils.py — text extraction, context building, HTML escaping
+  date_parser.py   — deterministic date-range extraction
+"""
+
 import datetime
-import hashlib
-import secrets
-import pandas as pd
-import requests as req
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
-from googleapiclient.discovery import build
-import anthropic
+import os
 
-# ── Config ──────────────────────────────────────────────────────────────────
-SCOPES = ["https://www.googleapis.com/auth/chat.spaces.readonly",
-          "https://www.googleapis.com/auth/chat.messages.readonly",
-          "https://www.googleapis.com/auth/chat.memberships.readonly"]
+import streamlit as st
 
-LOGIN_SCOPES = ["openid", "email", "profile"]
+from config import (
+    BASE_DIR,
+    CACHE_LOOKBACK_DAYS,
+    CLIENT_SECRET_PATH,
+    DEFAULT_LOOKBACK_DAYS,
+    TARGET_SPACE_NAMES,
+    TOKEN_PATH,
+    MAX_CHAT_HISTORY_MESSAGES,
+)
+from login import check_google_auth
+from chat_api import (
+    get_credentials,
+    fetch_spaces,
+    refresh_cache,
+    cache_needs_refresh,
+    cache_last_refreshed,
+    get_messages_for_range,
+)
+from message_utils import (
+    get_sender_name,
+    extract_text,
+    format_time,
+    safe,
+    build_conversation_context,
+    analysis_cache_key,
+)
+from llm_client import analyze_messages, chat_with_claude
+from date_parser import parse_date_range
 
-TARGET_SPACES = [
-    "(New) ECC DRI's Huddle",
-    "(New) ECC Panic Room",
-    "DRI's Huddle",
-    "Panic Room",
-]
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-TOKEN_PATH = os.path.join(BASE_DIR, "token.json")
-CLIENT_SECRET_PATH = os.path.join(BASE_DIR, "client_secret.json")
-
-ALLOWED_DOMAIN = "exotel.com"
-CACHE_LOOKBACK_DAYS = 30
-DEFAULT_LOOKBACK_DAYS = 7
-
-# OAuth client for user login (from secrets or client_secret.json)
-def _get_login_client():
-    try:
-        return st.secrets["GOOGLE_CLIENT_ID"], st.secrets["GOOGLE_CLIENT_SECRET"]
-    except Exception:
-        pass
-    if os.path.exists(CLIENT_SECRET_PATH):
-        with open(CLIENT_SECRET_PATH) as f:
-            info = json.load(f).get("web", {})
-            return info.get("client_id", ""), info.get("client_secret", "")
-    return "", ""
-
-LOGIN_CLIENT_ID, LOGIN_CLIENT_SECRET = _get_login_client()
-
+# ── Page config (must be first Streamlit call) ───────────────────────────────
 st.set_page_config(page_title="ECC Space Monitor", page_icon="📊", layout="wide")
 
 
-# ── Google OAuth Login ──────────────────────────────────────────────────────
-def _get_redirect_uri():
-    """Detect the correct redirect URI based on environment."""
-    # Check if running on Streamlit Cloud
-    try:
-        app_url = st.secrets.get("APP_URL", "")
-        if app_url:
-            return app_url.rstrip("/")
-    except Exception:
-        pass
-    return "http://localhost:8501"
-
-
-def _build_google_auth_url():
-    """Build Google OAuth2 authorization URL for user login."""
-    redirect_uri = _get_redirect_uri()
-    state = secrets.token_urlsafe(32)
-    st.session_state["oauth_login_state"] = state
-
-    params = {
-        "client_id": LOGIN_CLIENT_ID,
-        "redirect_uri": redirect_uri,
-        "response_type": "code",
-        "scope": " ".join(LOGIN_SCOPES),
-        "access_type": "online",
-        "state": state,
-        "hd": ALLOWED_DOMAIN,  # Restrict to exotel.com in Google's UI
-        "prompt": "select_account",
-    }
-    qs = "&".join(f"{k}={v}" for k, v in params.items())
-    return f"https://accounts.google.com/o/oauth2/v2/auth?{qs}"
-
-
-def _exchange_code_for_user_info(code):
-    """Exchange authorization code for user info."""
-    redirect_uri = _get_redirect_uri()
-    token_resp = req.post("https://oauth2.googleapis.com/token", data={
-        "code": code,
-        "client_id": LOGIN_CLIENT_ID,
-        "client_secret": LOGIN_CLIENT_SECRET,
-        "redirect_uri": redirect_uri,
-        "grant_type": "authorization_code",
-    })
-    token_data = token_resp.json()
-    if "error" in token_data:
-        return None, f"Token error: {token_data.get('error_description', token_data['error'])}"
-
-    # Get user info
-    userinfo_resp = req.get("https://www.googleapis.com/oauth2/v2/userinfo",
-                            headers={"Authorization": f"Bearer {token_data['access_token']}"})
-    userinfo = userinfo_resp.json()
-    return userinfo, None
-
-
-def check_google_auth():
-    """Handle Google OAuth login flow. Returns True if authenticated."""
-    # Already authenticated
-    if "authenticated_email" in st.session_state and st.session_state["authenticated_email"]:
-        return True
-
-    # Check for OAuth callback
-    params = st.query_params
-    code = params.get("code")
-    if code:
-        # Prevent reuse
-        if "last_login_code" not in st.session_state or st.session_state["last_login_code"] != code:
-            st.session_state["last_login_code"] = code
-            userinfo, error = _exchange_code_for_user_info(code)
-            if error:
-                st.error(error)
-                st.query_params.clear()
-                return False
-            email = userinfo.get("email", "").lower()
-            if not email.endswith(f"@{ALLOWED_DOMAIN}"):
-                st.error(f"Access restricted to @{ALLOWED_DOMAIN} accounts. You signed in as {email}.")
-                st.query_params.clear()
-                return False
-            st.session_state["authenticated_email"] = email
-            st.session_state["user_name"] = userinfo.get("name", email)
-            st.session_state["user_picture"] = userinfo.get("picture", "")
-            st.query_params.clear()
-            st.rerun()
-        else:
-            st.query_params.clear()
-            return "authenticated_email" in st.session_state and bool(st.session_state["authenticated_email"])
-
-    # Show login page
-    st.markdown("""
-    <style>
-        .login-container {
-            display: flex; align-items: center; justify-content: center;
-            min-height: 70vh;
-        }
-        .login-box {
-            max-width: 420px; width: 100%;
-            background: white; border-radius: 16px;
-            padding: 48px 40px; text-align: center;
-            box-shadow: 0 4px 24px rgba(0,0,0,0.12);
-        }
-        .login-title { font-size: 26px; font-weight: 700; color: #1a1a2e; margin-bottom: 8px; }
-        .login-subtitle { font-size: 14px; color: #666; margin-bottom: 32px; }
-        .google-btn {
-            display: inline-flex; align-items: center; justify-content: center; gap: 12px;
-            background: #fff; color: #3c4043; border: 1px solid #dadce0;
-            border-radius: 8px; padding: 12px 24px; font-size: 15px; font-weight: 500;
-            text-decoration: none; transition: all 0.2s;
-            width: 100%; box-sizing: border-box;
-        }
-        .google-btn:hover { background: #f7f8f8; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-        .google-icon { width: 20px; height: 20px; }
-        .domain-note { font-size: 12px; color: #999; margin-top: 16px; }
-    </style>
-    """, unsafe_allow_html=True)
-
-    auth_url = _build_google_auth_url()
-
-    st.markdown(f"""
-    <div class="login-container">
-        <div class="login-box">
-            <div class="login-title">ECC Space Monitor</div>
-            <div class="login-subtitle">AI-powered Google Chat space analysis</div>
-            <a href="{auth_url}" class="google-btn">
-                <svg class="google-icon" viewBox="0 0 24 24">
-                    <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z"/>
-                    <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
-                    <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
-                    <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
-                </svg>
-                Sign in with Google
-            </a>
-            <div class="domain-note">Restricted to @exotel.com accounts</div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    return False
-
-
+# ── Login gate ───────────────────────────────────────────────────────────────
 if not check_google_auth():
     st.stop()
 
 
-# ── CSS ─────────────────────────────────────────────────────────────────────
+# ── CSS ──────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
@@ -208,28 +69,19 @@ st.markdown("""
         color: white;
     }
     .space-card {
-        background: white;
-        border-radius: 12px;
-        padding: 20px;
-        margin-bottom: 16px;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+        background: white; border-radius: 12px; padding: 20px;
+        margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08);
         border-left: 4px solid #0f3460;
     }
     .metric-card {
-        background: white;
-        border-radius: 12px;
-        padding: 16px;
-        text-align: center;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+        background: white; border-radius: 12px; padding: 16px;
+        text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.08);
     }
     .metric-value { font-size: 28px; font-weight: 700; color: #0f3460; }
     .metric-label { font-size: 13px; color: #666; margin-top: 4px; }
     .analysis-section {
-        background: white;
-        border-radius: 12px;
-        padding: 20px;
-        margin-bottom: 16px;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+        background: white; border-radius: 12px; padding: 20px;
+        margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08);
     }
     .msg-row { padding: 8px 0; border-bottom: 1px solid #f0f0f0; }
     .msg-sender { font-weight: 600; color: #1a1a2e; font-size: 13px; }
@@ -241,486 +93,38 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ── Auth ────────────────────────────────────────────────────────────────────
-def get_credentials():
-    """Get or refresh Google OAuth credentials from session, token file, or Streamlit secrets."""
-    # 1. Check session state
-    if "google_creds" in st.session_state:
-        creds = st.session_state["google_creds"]
-        if creds and creds.valid:
-            return creds
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-            st.session_state["google_creds"] = creds
-            _save_token(creds)
-            return creds
-
-    # 2. Check local token file (for local dev)
-    if os.path.exists(TOKEN_PATH):
-        try:
-            creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
-            if creds and creds.valid:
-                st.session_state["google_creds"] = creds
-                return creds
-            if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-                st.session_state["google_creds"] = creds
-                _save_token(creds)
-                return creds
-        except Exception:
-            pass
-
-    # 3. Check Streamlit secrets (for cloud deployment)
-    try:
-        token_data = None
-        if "GOOGLE_TOKEN" in st.secrets:
-            token_data = st.secrets["GOOGLE_TOKEN"]
-        if token_data:
-            if isinstance(token_data, str):
-                info = json.loads(token_data)
-            else:
-                info = dict(token_data)
-            creds = Credentials(
-                token=info.get("token", ""),
-                refresh_token=info.get("refresh_token"),
-                token_uri=info.get("token_uri", "https://oauth2.googleapis.com/token"),
-                client_id=info.get("client_id"),
-                client_secret=info.get("client_secret"),
-                scopes=SCOPES,
-            )
-            if creds.refresh_token:
-                try:
-                    creds.refresh(Request())
-                except Exception:
-                    pass
-            st.session_state["google_creds"] = creds
-            return creds
-    except Exception as e:
-        st.sidebar.warning(f"Token from secrets failed: {e}")
-
-    return None
-
-
-def _save_token(creds):
-    try:
-        with open(TOKEN_PATH, "w") as f:
-            f.write(creds.to_json())
-    except Exception:
-        pass  # On cloud, we can't write files
-
-
-# ── Google Chat API helpers ─────────────────────────────────────────────────
-@st.cache_data(ttl=300)
-def fetch_spaces(_creds_json):
-    creds = Credentials.from_authorized_user_info(json.loads(_creds_json), SCOPES)
-    service = build("chat", "v1", credentials=creds)
-    results = []
-    page_token = None
-    while True:
-        resp = service.spaces().list(pageSize=100, pageToken=page_token).execute()
-        results.extend(resp.get("spaces", []))
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
-    matched = [s for s in results if s.get("displayName") in TARGET_SPACES]
-    return matched
-
-
-def _fetch_messages_from_api(creds_json, space_name, start_date_str, end_date_str):
-    """Raw API call to fetch messages from a space within a date range."""
-    creds = Credentials.from_authorized_user_info(json.loads(creds_json), SCOPES)
-    service = build("chat", "v1", credentials=creds)
-
-    start_ts = f"{start_date_str}T00:00:00Z"
-    end_ts = f"{end_date_str}T23:59:59Z"
-    api_filter = f'createTime > "{start_ts}" AND createTime < "{end_ts}"'
-
-    MAX_MESSAGES_PER_SPACE = 1000
-
-    messages = []
-    page_token = None
-    while True:
-        resp = (service.spaces().messages()
-                .list(parent=space_name,
-                      pageSize=100,
-                      filter=api_filter,
-                      orderBy="createTime desc",
-                      pageToken=page_token)
-                .execute())
-        messages.extend(resp.get("messages", []))
-        page_token = resp.get("nextPageToken")
-        if not page_token or len(messages) >= MAX_MESSAGES_PER_SPACE:
-            break
-
-    messages = messages[:MAX_MESSAGES_PER_SPACE]
-    messages.reverse()
-    return messages
-
-
-# ── Message Cache ────────────────────────────────────────────────────────────
-# Stores all fetched messages in session state, keyed by space.
-# The cache remembers its date boundaries and only fetches new/missing ranges.
-
-def _get_message_cache():
-    """Get or initialize the message cache in session state."""
-    if "message_cache" not in st.session_state:
-        st.session_state["message_cache"] = {}
-        # { space_name: { "messages": [...], "earliest": "YYYY-MM-DD", "latest": "YYYY-MM-DD" } }
-    return st.session_state["message_cache"]
-
-
-def _cache_last_refreshed():
-    """Return the timestamp of the last cache refresh."""
-    return st.session_state.get("cache_last_refreshed", None)
-
-
-def refresh_cache(creds_json, spaces, lookback_days=30):
-    """Pre-fetch last N days of messages for all spaces into the cache.
-
-    Called once on app startup and when the user clicks Refresh.
-    """
-    cache = _get_message_cache()
-    today = datetime.date.today()
-    start = today - datetime.timedelta(days=lookback_days)
-
-    for space in spaces:
-        display_name = space.get("displayName", space["name"])
-        space_id = space["name"]
-        try:
-            msgs = _fetch_messages_from_api(creds_json, space_id,
-                                            start.isoformat(), today.isoformat())
-            cache[display_name] = {
-                "messages": msgs,
-                "space_id": space_id,
-                "earliest": start.isoformat(),
-                "latest": today.isoformat(),
-            }
-        except Exception as e:
-            st.warning(f"Could not fetch messages from {display_name}: {e}")
-            if display_name not in cache:
-                cache[display_name] = {
-                    "messages": [],
-                    "space_id": space_id,
-                    "earliest": start.isoformat(),
-                    "latest": today.isoformat(),
-                }
-
-    st.session_state["cache_last_refreshed"] = datetime.datetime.now()
-    st.session_state["cache_lookback_days"] = lookback_days
-    return cache
-
-
-def get_messages_for_range(creds_json, spaces, start_str, end_str):
-    """Get messages for a date range, using cache when possible.
-
-    If the requested range is within the cached window, filters from cache.
-    If it extends beyond, fetches the missing range and merges.
-    """
-    cache = _get_message_cache()
-    result = {}
-
-    for space in spaces:
-        display_name = space.get("displayName", space["name"])
-        space_id = space["name"]
-        cached = cache.get(display_name, {})
-        cached_earliest = cached.get("earliest", "")
-        cached_latest = cached.get("latest", "")
-        cached_msgs = cached.get("messages", [])
-
-        req_start = datetime.date.fromisoformat(start_str)
-        req_end = datetime.date.fromisoformat(end_str)
-
-        # Case 1: Requested range is fully within cache
-        if cached_earliest and cached_latest:
-            cache_start = datetime.date.fromisoformat(cached_earliest)
-            cache_end = datetime.date.fromisoformat(cached_latest)
-
-            if req_start >= cache_start and req_end <= cache_end:
-                # Filter cached messages by date
-                filtered = [
-                    m for m in cached_msgs
-                    if _msg_in_range(m, start_str, end_str)
-                ]
-                result[display_name] = filtered
-                continue
-
-        # Case 2: Need to fetch (partially or fully outside cache)
-        try:
-            msgs = _fetch_messages_from_api(creds_json, space_id, start_str, end_str)
-            result[display_name] = msgs
-
-            # Merge into cache to grow the cached window
-            if cached_msgs:
-                all_msg_ids = {m.get("name") for m in cached_msgs}
-                new_msgs = [m for m in msgs if m.get("name") not in all_msg_ids]
-                merged = cached_msgs + new_msgs
-                merged.sort(key=lambda m: m.get("createTime", ""))
-                new_earliest = min(cached_earliest, start_str)
-                new_latest = max(cached_latest, end_str)
-            else:
-                merged = msgs
-                new_earliest = start_str
-                new_latest = end_str
-
-            cache[display_name] = {
-                "messages": merged,
-                "space_id": space_id,
-                "earliest": new_earliest,
-                "latest": new_latest,
-            }
-        except Exception as e:
-            st.warning(f"Could not fetch messages from {display_name}: {e}")
-            result[display_name] = []
-
-    return result
-
-
-def _msg_in_range(msg, start_str, end_str):
-    """Check if a message's createTime falls within the given date range."""
-    create_time = msg.get("createTime", "")
-    if not create_time:
-        return False
-    try:
-        msg_date = create_time[:10]  # "2026-03-17T..." → "2026-03-17"
-        return start_str <= msg_date <= end_str
-    except Exception:
-        return True  # include if we can't parse
-
-
-def get_sender_name(msg):
-    sender = msg.get("sender", {})
-    return sender.get("displayName", sender.get("name", "Unknown"))
-
-
-def format_time(time_str):
-    try:
-        dt = datetime.datetime.fromisoformat(time_str.replace("Z", "+00:00"))
-        return dt.strftime("%b %d, %I:%M %p")
-    except Exception:
-        return time_str
-
-
-def extract_message_text(msg):
-    """Extract all text content from a message, including quoted replies and annotations."""
-    parts = []
-    # Primary text content
-    text = msg.get("text", "") or ""
-    if not text:
-        text = msg.get("formattedText", "") or ""
-    if text.strip():
-        parts.append(text.strip())
-    # Quoted message (thread replies)
-    quoted = msg.get("quotedMessageMetadata", {})
-    if quoted and quoted.get("lastUpdateTime"):
-        # The quoted text is usually in the main text already, but flag it
-        pass
-    # Attachment names (often contain context like "Screenshot", ticket IDs, etc.)
-    for att in msg.get("attachment", []):
-        att_name = att.get("contentName", "")
-        if att_name:
-            parts.append(f"[Attachment: {att_name}]")
-    # Cards / card content
-    for card in msg.get("cardsV2", msg.get("cards", [])):
-        card_body = json.dumps(card) if isinstance(card, dict) else str(card)
-        # Extract just text values from card JSON
-        texts = re.findall(r'"text"\s*:\s*"([^"]+)"', card_body)
-        if texts:
-            parts.append(" | ".join(texts))
-    return " ".join(parts)
-
-
-def build_conversation_context(all_messages_by_space):
-    """Build a combined context string from all spaces for the chatbot.
-
-    Caps total output at ~500K characters (~125K tokens) to stay safely
-    within Claude's 200K-token context window after accounting for the
-    system prompt, user query, and response space.
-    """
-    MAX_CHARS = 500_000  # ~125K tokens (4 chars ≈ 1 token)
-    total_chars = 0
-    parts = []
-    for space_name, messages in all_messages_by_space.items():
-        msg_lines = []
-        for m in messages:
-            sender = get_sender_name(m)
-            text = extract_message_text(m)
-            time = format_time(m.get("createTime", ""))
-            if text.strip():
-                line = f"[{time}] {sender}: {text}"
-                if total_chars + len(line) > MAX_CHARS:
-                    msg_lines.append("[... truncated to fit context window ...]")
-                    break
-                msg_lines.append(line)
-                total_chars += len(line) + 1  # +1 for newline
-        if msg_lines:
-            header = f"\n=== SPACE: {space_name} ===\n"
-            total_chars += len(header)
-            parts.append(header + "\n".join(msg_lines))
-        if total_chars >= MAX_CHARS:
-            break
-    return "\n".join(parts)
-
-
-# ── Claude helpers ──────────────────────────────────────────────────────────
-def analyze_messages(messages, space_display_name, api_key):
-    if not messages:
-        return "No messages to analyze."
-
-    MAX_CHARS = 500_000
-    total_chars = 0
-    msg_text = []
-    for m in messages:
-        sender = get_sender_name(m)
-        text = extract_message_text(m)
-        time = format_time(m.get("createTime", ""))
-        if text.strip():
-            line = f"[{time}] {sender}: {text}"
-            if total_chars + len(line) > MAX_CHARS:
-                msg_text.append("[... truncated to fit context window ...]")
-                break
-            msg_text.append(line)
-            total_chars += len(line) + 1
-
-    conversation = "\n".join(msg_text)
-
-    client = anthropic.Anthropic(api_key=api_key)
-    response = client.messages.create(
-        model="claude-sonnet-4-5-20250929",
-        max_tokens=2048,
-        temperature=0.2,
-        messages=[{
-            "role": "user",
-            "content": f"""Analyze the following messages from the Google Chat space "{space_display_name}".
-
-Provide a comprehensive analysis with these sections:
-
-## Key Topics & Themes
-Identify the main topics being discussed.
-
-## Critical Issues / Escalations
-Any urgent problems, outages, customer escalations, or blockers mentioned.
-
-## Action Items
-List specific action items with who is responsible (if mentioned).
-
-## Unresolved Items
-Things that were raised but not yet resolved or answered.
-
-## Decisions Made
-Any decisions or agreements reached.
-
-## Sentiment & Engagement
-Overall tone - is the team stressed, collaborative, calm? Who are the most active participants?
-
-## Summary
-A 3-4 sentence executive summary of what's happening in this space.
-
----
-MESSAGES:
-{conversation}"""
-        }]
-    )
-    return response.content[0].text
-
-
-def extract_date_range(user_question, api_key):
-    """Use Claude to extract a date range from the user's question.
-
-    Returns (start_date_str, end_date_str) in YYYY-MM-DD format,
-    or None if no specific date range is mentioned (use default).
-    """
-    today = datetime.date.today()
-    client = anthropic.Anthropic(api_key=api_key)
-    response = client.messages.create(
-        model="claude-sonnet-4-5-20250929",
-        max_tokens=200,
-        temperature=0,
-        messages=[{
-            "role": "user",
-            "content": f"""Today is {today.isoformat()} ({today.strftime("%A")}).
-
-Extract the date range from this question. If no specific time period is mentioned, reply ONLY with "DEFAULT".
-If a date range is mentioned (e.g. "last week", "past month", "in January", "last 3 days", "yesterday", "since March 1"), reply ONLY with two dates in this exact format:
-START=YYYY-MM-DD
-END=YYYY-MM-DD
-
-Cap the range at 60 days maximum. If the user says "all time" or something very broad, use the last 60 days.
-
-Question: {user_question}"""
-        }]
-    )
-    text = response.content[0].text.strip()
-    if text == "DEFAULT":
-        return None
-    try:
-        lines = text.strip().split("\n")
-        start_str = lines[0].split("=")[1].strip()
-        end_str = lines[1].split("=")[1].strip()
-        # Validate dates
-        datetime.date.fromisoformat(start_str)
-        datetime.date.fromisoformat(end_str)
-        return start_str, end_str
-    except Exception:
-        return None
-
-
-def chat_with_claude(user_question, conversation_context, date_label, chat_history, api_key):
-    """Send a question to Claude with full space context and chat history."""
-    client = anthropic.Anthropic(api_key=api_key)
-
-    system_prompt = f"""You are the ECC Space Monitor AI assistant. You have access to messages from multiple Google Chat spaces at Exotel.
-Answer questions accurately based on the messages below. If the information isn't in the messages, say so.
-Be specific - mention names, dates, and quote relevant messages when helpful.
-If asked about trends, patterns, or comparisons across spaces, analyze all available data.
-
-TODAY'S DATE: {datetime.datetime.now().strftime("%B %d, %Y")}
-MESSAGE WINDOW: {date_label}
-
-AVAILABLE SPACE MESSAGES:
-{conversation_context}"""
-
-    # Build messages list from chat history
-    messages = []
-    for msg in chat_history:
-        messages.append({"role": msg["role"], "content": msg["content"]})
-    messages.append({"role": "user", "content": user_question})
-
-    response = client.messages.create(
-        model="claude-sonnet-4-5-20250929",
-        max_tokens=4096,
-        temperature=0.3,
-        system=system_prompt,
-        messages=messages,
-    )
-    return response.content[0].text
-
-
-# ── Sidebar ─────────────────────────────────────────────────────────────────
+# ── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
     # User info
-    user_name = st.session_state.get("user_name", "")
-    user_email = st.session_state.get("authenticated_email", "")
+    user_name = safe(st.session_state.get("user_name", ""))
+    user_email = safe(st.session_state.get("authenticated_email", ""))
     user_pic = st.session_state.get("user_picture", "")
     if user_pic:
-        st.markdown(f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">'
-                    f'<img src="{user_pic}" style="width:32px;height:32px;border-radius:50%;">'
-                    f'<div><div style="font-weight:600;font-size:14px;color:white;">{user_name}</div>'
-                    f'<div style="font-size:11px;color:#aaa;">{user_email}</div></div></div>',
-                    unsafe_allow_html=True)
+        # Profile picture comes from Google — URL is trustworthy but we escape text
+        st.markdown(
+            f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">'
+            f'<img src="{safe(user_pic)}" style="width:32px;height:32px;border-radius:50%;">'
+            f'<div><div style="font-weight:600;font-size:14px;color:white;">{user_name}</div>'
+            f'<div style="font-size:11px;color:#aaa;">{user_email}</div></div></div>',
+            unsafe_allow_html=True,
+        )
     elif user_email:
         st.markdown(f"**{user_email}**")
     if st.button("Logout", use_container_width=True, key="logout_btn"):
-        for key in ["authenticated_email", "user_name", "user_picture", "last_login_code"]:
+        for key in ["authenticated_email", "user_name", "user_picture", "last_login_code",
+                     "oauth_login_state"]:
             st.session_state.pop(key, None)
         st.rerun()
 
     st.divider()
     st.markdown("## ECC Space Monitor")
-    st.markdown(f'<span class="status-dot"></span> Monitoring {len(TARGET_SPACES)} spaces',
-                unsafe_allow_html=True)
+    st.markdown(
+        f'<span class="status-dot"></span> Monitoring {len(TARGET_SPACE_NAMES)} spaces',
+        unsafe_allow_html=True,
+    )
     st.divider()
 
-    # Load API key from secrets
+    # API key
     _secrets_key = st.secrets.get("ANTHROPIC_API_KEY", "") if hasattr(st, "secrets") else ""
     _env_key = os.environ.get("ANTHROPIC_API_KEY", "")
     default_key = _secrets_key or _env_key
@@ -732,17 +136,18 @@ with st.sidebar:
 
     st.divider()
     st.markdown("**Target Spaces:**")
-    for s in TARGET_SPACES:
+    for s in TARGET_SPACE_NAMES:
         st.markdown(f"- {s}")
 
     # Cache status
-    _cr = _cache_last_refreshed()
+    _cr = cache_last_refreshed()
     if _cr:
-        cache = _get_message_cache()
-        total_cached = sum(len(v.get("messages", [])) for v in cache.values())
+        from chat_api import _get_cache
+        _cache = _get_cache()
+        total_cached = sum(len(v.get("messages", [])) for v in _cache.values())
         cache_range = st.session_state.get("cache_lookback_days", CACHE_LOOKBACK_DAYS)
         st.divider()
-        st.markdown("**📦 Message Cache**")
+        st.markdown("**Message Cache**")
         st.caption(f"{total_cached} messages cached ({cache_range}d window)")
         st.caption(f"Last refresh: {_cr.strftime('%I:%M %p')}")
 
@@ -758,18 +163,17 @@ with st.sidebar:
         st.rerun()
 
 
-# ── Main ────────────────────────────────────────────────────────────────────
+# ── Main ─────────────────────────────────────────────────────────────────────
 st.markdown("# ECC Space Monitor")
 st.caption("Real-time monitoring, AI analysis, and Q&A for Google Chat spaces")
 
-# Check auth
+# Chat API credentials
 creds = get_credentials()
-
 if not creds:
     st.warning("Not authenticated with Google Chat API.")
     if not os.path.exists(CLIENT_SECRET_PATH):
         st.error(f"Missing `client_secret.json` at:\n`{CLIENT_SECRET_PATH}`")
-    st.info("Run this command in your terminal to authenticate:\n\n"
+    st.info(f"Run this command in your terminal to authenticate:\n\n"
             f"```\ncd {BASE_DIR} && python3 auth.py\n```")
     if st.button("I've authenticated - Refresh", type="primary"):
         st.rerun()
@@ -777,7 +181,7 @@ if not creds:
 
 creds_json = creds.to_json()
 
-# ── Fetch spaces ────────────────────────────────────────────────────────────
+# ── Fetch spaces ─────────────────────────────────────────────────────────────
 with st.spinner("Fetching spaces..."):
     try:
         spaces = fetch_spaces(creds_json)
@@ -786,44 +190,41 @@ with st.spinner("Fetching spaces..."):
         if "invalid_grant" in str(e).lower() or "expired" in str(e).lower():
             if os.path.exists(TOKEN_PATH):
                 os.remove(TOKEN_PATH)
-            if "google_creds" in st.session_state:
-                del st.session_state["google_creds"]
+            st.session_state.pop("google_creds", None)
             st.warning("Token expired. Please re-authenticate.")
             st.rerun()
         st.stop()
 
 if not spaces:
     st.warning("No matching spaces found. Make sure you're a member of the target spaces.")
+    from googleapiclient.discovery import build as _build
+    from google.oauth2.credentials import Credentials as _Creds
+    import json as _json
+    from config import CHAT_SCOPES as _SCOPES
     with st.expander("Debug: All spaces found"):
         try:
-            creds_obj = Credentials.from_authorized_user_info(json.loads(creds_json), SCOPES)
-            service = build("chat", "v1", credentials=creds_obj)
-            all_spaces = []
-            page_token = None
+            _c = _Creds.from_authorized_user_info(_json.loads(creds_json), _SCOPES)
+            _svc = _build("chat", "v1", credentials=_c)
+            _all = []
+            _pt = None
             while True:
-                resp = service.spaces().list(pageSize=100, pageToken=page_token).execute()
-                all_spaces.extend(resp.get("spaces", []))
-                page_token = resp.get("nextPageToken")
-                if not page_token:
+                _r = _svc.spaces().list(pageSize=100, pageToken=_pt).execute()
+                _all.extend(_r.get("spaces", []))
+                _pt = _r.get("nextPageToken")
+                if not _pt:
                     break
-            for s in all_spaces:
+            for s in _all:
                 st.write(f"- **{s.get('displayName', 'N/A')}** ({s.get('name')}) type={s.get('type')}")
         except Exception as e:
             st.error(str(e))
     st.stop()
 
-# ── Message Cache (pre-fetch last 30 days, refresh hourly) ─────────────────
-_cache_refresh = _cache_last_refreshed()
-_needs_refresh = (
-    _cache_refresh is None
-    or (datetime.datetime.now() - _cache_refresh).total_seconds() > 3600  # 1 hour
-)
-
-if _needs_refresh:
-    with st.spinner("📦 Loading message cache (last 30 days)... this is a one-time load"):
+# ── Populate cache ───────────────────────────────────────────────────────────
+if cache_needs_refresh():
+    with st.spinner("Loading message cache (last 30 days)... one-time load"):
         refresh_cache(creds_json, spaces, lookback_days=CACHE_LOOKBACK_DAYS)
 
-# Get last 7 days from cache for dashboard display
+# Dashboard default: last 7 days from cache
 _today = datetime.date.today()
 _default_start = _today - datetime.timedelta(days=DEFAULT_LOOKBACK_DAYS)
 
@@ -831,41 +232,52 @@ all_messages_by_space = get_messages_for_range(
     creds_json, spaces, _default_start.isoformat(), _today.isoformat()
 )
 total_msg_count = sum(len(v) for v in all_messages_by_space.values())
-
-# Build context for chatbot (default window)
 conversation_context = build_conversation_context(all_messages_by_space)
 
-# ── Metrics row ─────────────────────────────────────────────────────────────
+# ── Metrics row ──────────────────────────────────────────────────────────────
 st.markdown("---")
 mcol1, mcol2, mcol3, mcol4 = st.columns(4)
 with mcol1:
-    st.markdown(f'<div class="metric-card"><div class="metric-value">{len(spaces)}</div>'
-                f'<div class="metric-label">Spaces Connected</div></div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="metric-card"><div class="metric-value">{len(spaces)}</div>'
+        f'<div class="metric-label">Spaces Connected</div></div>',
+        unsafe_allow_html=True,
+    )
 with mcol2:
-    _cache = _get_message_cache()
-    _total_cached = sum(len(v.get("messages", [])) for v in _cache.values())
-    st.markdown(f'<div class="metric-card"><div class="metric-value">{_total_cached}</div>'
-                f'<div class="metric-label">Messages Cached (30d)</div></div>', unsafe_allow_html=True)
+    from chat_api import _get_cache as _gc
+    _total_cached = sum(len(v.get("messages", [])) for v in _gc().values())
+    st.markdown(
+        f'<div class="metric-card"><div class="metric-value">{_total_cached}</div>'
+        f'<div class="metric-label">Messages Cached (30d)</div></div>',
+        unsafe_allow_html=True,
+    )
 with mcol3:
     now = datetime.datetime.now().strftime("%I:%M %p")
-    st.markdown(f'<div class="metric-card"><div class="metric-value">{now}</div>'
-                f'<div class="metric-label">Last Refresh</div></div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="metric-card"><div class="metric-value">{now}</div>'
+        f'<div class="metric-label">Last Refresh</div></div>',
+        unsafe_allow_html=True,
+    )
 with mcol4:
-    st.markdown(f'<div class="metric-card"><div class="metric-value">Claude</div>'
-                f'<div class="metric-label">Analysis Engine</div></div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="metric-card"><div class="metric-value">Claude</div>'
+        f'<div class="metric-label">Analysis Engine</div></div>',
+        unsafe_allow_html=True,
+    )
 
-# ── Two main sections: Chat + Dashboard ─────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TABS
+# ══════════════════════════════════════════════════════════════════════════════
 st.markdown("---")
 tab_chat, tab_dashboard = st.tabs(["Ask Anything", "Space Dashboard"])
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 1: CHAT INTERFACE
-# ══════════════════════════════════════════════════════════════════════════════
+
+# ── TAB 1: CHAT ──────────────────────────────────────────────────────────────
 with tab_chat:
     st.markdown("### Ask anything about your spaces")
     st.caption("Ask questions, request analysis, compare spaces, find action items, track issues...")
 
-    # Example queries
     with st.expander("Example questions you can ask"):
         st.markdown("""
 - What are the top issues raised across all spaces today?
@@ -880,31 +292,31 @@ with tab_chat:
 - Give me an executive briefing for all spaces
         """)
 
-    # Initialize chat history
     if "chat_messages" not in st.session_state:
         st.session_state["chat_messages"] = []
 
-    # Display chat history
     for msg in st.session_state["chat_messages"]:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    # Chat input
     if prompt := st.chat_input("Ask about your Google Chat spaces..."):
         if not api_key:
             st.warning("Please enter your Anthropic API Key in the sidebar.")
         else:
-            # Add user message
             st.session_state["chat_messages"].append({"role": "user", "content": prompt})
             with st.chat_message("user"):
                 st.markdown(prompt)
 
-            # Get Claude response
             with st.chat_message("assistant"):
                 try:
-                    # Step 1: Extract date range from the query
-                    with st.spinner("Understanding your question..."):
-                        date_range = extract_date_range(prompt, api_key)
+                    # Step 1: Deterministic date parsing (no LLM call)
+                    date_range = parse_date_range(prompt)
+
+                    # Step 2: Fall back to Claude only if deterministic parser can't handle it
+                    if date_range is None:
+                        from llm_client import extract_date_range_llm
+                        with st.spinner("Understanding your question..."):
+                            date_range = extract_date_range_llm(prompt, api_key)
 
                     if date_range:
                         q_start, q_end = date_range
@@ -915,31 +327,36 @@ with tab_chat:
                             )
                             chat_context = build_conversation_context(q_messages_by_space)
                             total_q = sum(len(v) for v in q_messages_by_space.values())
-                        st.caption(f"📅 Searched {date_label} — {total_q} messages found")
+                        st.caption(f"Searched {date_label} — {total_q} messages found")
                     else:
-                        # Use default 7-day context
                         chat_context = conversation_context
                         date_label = f"Last {DEFAULT_LOOKBACK_DAYS} days"
 
-                    # Step 2: Answer the question
+                    # Step 3: Answer
                     with st.spinner("Analyzing..."):
                         response = chat_with_claude(
                             prompt,
                             chat_context,
                             date_label,
                             st.session_state["chat_messages"][:-1],
-                            api_key
+                            api_key,
                         )
                         st.markdown(response)
                         st.session_state["chat_messages"].append(
                             {"role": "assistant", "content": response}
                         )
+
+                    # Trim history to keep within budget
+                    if len(st.session_state["chat_messages"]) > MAX_CHAT_HISTORY_MESSAGES:
+                        st.session_state["chat_messages"] = (
+                            st.session_state["chat_messages"][-MAX_CHAT_HISTORY_MESSAGES:]
+                        )
+
                 except Exception as e:
                     st.error(f"Error: {e}")
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 2: SPACE DASHBOARD
-# ══════════════════════════════════════════════════════════════════════════════
+
+# ── TAB 2: DASHBOARD ─────────────────────────────────────────────────────────
 with tab_dashboard:
     space_names = [s.get("displayName", s["name"]) for s in spaces]
     space_tabs = st.tabs(space_names + ["All Spaces"])
@@ -954,74 +371,82 @@ with tab_dashboard:
                 st.info(f"No messages found in {display_name}.")
                 continue
 
-            st.markdown(f'<div class="space-card">'
-                        f'<h3>{display_name}</h3>'
-                        f'<p>{len(messages)} messages fetched | Space ID: <code>{space_id}</code></p>'
-                        f'</div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="space-card">'
+                f'<h3>{safe(display_name)}</h3>'
+                f'<p>{len(messages)} messages fetched | Space ID: <code>{safe(space_id)}</code></p>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
 
             left, right = st.columns([3, 2])
 
             with left:
                 st.markdown("### AI Analysis")
                 if api_key:
-                    analysis_key = f"analysis_{space_id}"
+                    # Hash-based cache key — skip re-analysis if nothing changed
+                    cache_key = analysis_cache_key(space_id, messages)
+                    analysis_state_key = f"analysis_{cache_key}"
+
                     if st.button(f"Analyse {display_name}", key=f"btn_{space_id}",
                                  type="primary", use_container_width=True):
                         with st.spinner("Claude is analyzing..."):
                             try:
                                 result = analyze_messages(messages, display_name, api_key)
-                                st.session_state[analysis_key] = result
+                                st.session_state[analysis_state_key] = result
                             except Exception as e:
                                 st.error(f"Analysis error: {e}")
 
-                    if analysis_key in st.session_state:
-                        st.markdown(f'<div class="analysis-section">', unsafe_allow_html=True)
-                        st.markdown(st.session_state[analysis_key])
+                    if analysis_state_key in st.session_state:
+                        st.markdown('<div class="analysis-section">', unsafe_allow_html=True)
+                        st.markdown(st.session_state[analysis_state_key])
                         st.markdown('</div>', unsafe_allow_html=True)
                 else:
                     st.warning("Enter your Anthropic API Key in the sidebar.")
 
             with right:
                 st.markdown("### Recent Messages")
-                for m in messages[:30]:
-                    sender = get_sender_name(m)
-                    text = m.get("text", m.get("formattedText", ""))
-                    time = format_time(m.get("createTime", ""))
+                for m in messages[-30:]:  # show most recent 30
+                    sender = safe(get_sender_name(m))
+                    text = safe(extract_text(m)[:300])
+                    time = safe(format_time(m.get("createTime", "")))
                     if text.strip():
                         st.markdown(
                             f'<div class="msg-row">'
                             f'<span class="msg-sender">{sender}</span> '
                             f'<span class="msg-time">{time}</span>'
-                            f'<div class="msg-text">{text[:300]}</div>'
+                            f'<div class="msg-text">{text}</div>'
                             f'</div>',
-                            unsafe_allow_html=True
+                            unsafe_allow_html=True,
                         )
 
-    # ── "All Spaces" tab ────────────────────────────────────────────────────
+    # ── All Spaces tab ───────────────────────────────────────────────────
     with space_tabs[-1]:
         st.markdown("### Analyse All Spaces")
         if api_key:
             if st.button("Run Full Analysis", type="primary", use_container_width=True):
                 progress = st.progress(0)
                 for i, space in enumerate(spaces):
-                    display_name = space.get("displayName", space["name"])
-                    space_id = space["name"]
-                    with st.spinner(f"Analyzing {display_name}..."):
+                    dn = space.get("displayName", space["name"])
+                    sid = space["name"]
+                    with st.spinner(f"Analyzing {dn}..."):
                         try:
-                            msgs = all_messages_by_space.get(display_name, [])
-                            result = analyze_messages(msgs, display_name, api_key)
-                            st.session_state[f"analysis_{space_id}"] = result
+                            msgs = all_messages_by_space.get(dn, [])
+                            result = analyze_messages(msgs, dn, api_key)
+                            ck = analysis_cache_key(sid, msgs)
+                            st.session_state[f"analysis_{ck}"] = result
                         except Exception as e:
-                            st.error(f"Error analyzing {display_name}: {e}")
+                            st.error(f"Error analyzing {dn}: {e}")
                     progress.progress((i + 1) / len(spaces))
                 st.success("All spaces analyzed!")
                 st.rerun()
 
-            # Show all analyses
             for space in spaces:
-                display_name = space.get("displayName", space["name"])
-                space_id = space["name"]
-                analysis_key = f"analysis_{space_id}"
-                if analysis_key in st.session_state:
-                    with st.expander(f"{display_name}", expanded=True):
-                        st.markdown(st.session_state[analysis_key])
+                dn = space.get("displayName", space["name"])
+                sid = space["name"]
+                msgs = all_messages_by_space.get(dn, [])
+                ck = analysis_cache_key(sid, msgs)
+                ak = f"analysis_{ck}"
+                if ak in st.session_state:
+                    with st.expander(f"{dn}", expanded=True):
+                        st.markdown(st.session_state[ak])
