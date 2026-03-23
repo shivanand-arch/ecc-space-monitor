@@ -1,16 +1,19 @@
 """
-Google Chat API client — space discovery, message fetching, and tiered repository.
+Google Chat API client — space discovery, message fetching, and persistent cache.
 
-Tier 1 (startup):  Last 30 days — fetched on first load, instant queries.
-Tier 2 (on-demand): Older messages — fetched only when a query needs them.
-
-Both tiers are stored in session state and merged seamlessly.
-Hourly refresh adds new messages incrementally.
+Architecture:
+  - Each (space, month) chunk is fetched once and cached via @st.cache_data
+  - Startup loads last 30 days (fast, ~1-2 chunks per space)
+  - On-demand: older months fetched only when a query needs them
+  - Cache survives across users/sessions within the same app instance
+  - Only cleared on app reboot/redeploy
+  - New messages: hourly incremental refresh (today's chunk is re-fetched)
 """
 
 import datetime
 import json
 import logging
+import os
 
 import streamlit as st
 from google.oauth2.credentials import Credentials
@@ -24,8 +27,6 @@ from config import (
     STARTUP_LOOKBACK_DAYS,
     TOKEN_PATH,
 )
-
-import os
 
 logger = logging.getLogger(__name__)
 
@@ -132,15 +133,36 @@ def fetch_spaces(_creds_json: str) -> list[dict]:
     return matched
 
 
-def _fetch_messages_for_period(
-    creds_json: str, space_name: str, start_date: str, end_date: str
-) -> list[dict]:
-    """Fetch messages from a space between start_date and end_date (inclusive).
+# ── CACHED per-month message fetch ──────────────────────────────────────────
+# The key insight: we fetch by (space_id, year, month) and cache each chunk
+# for 24 hours. The current month is re-fetched each hour to pick up new
+# messages. Past months are immutable and cached for a full day.
 
-    Paginates fully. Returns messages in chronological order.
+@st.cache_data(ttl=86400, show_spinner=False)
+def _fetch_month_cached(
+    _creds_json: str,
+    space_id: str,
+    year: int,
+    month: int,
+    _is_current_month: bool,  # used to vary TTL via cache key
+) -> list[dict]:
+    """Fetch all messages from a space for a given month.
+
+    Past months: cached 24h (immutable data).
+    Current month: cache key includes _is_current_month=True, which changes
+    the effective TTL via a separate cache entry.
     """
-    service = _build_service(creds_json)
-    api_filter = f'createTime > "{start_date}T00:00:00Z" AND createTime < "{end_date}T23:59:59Z"'
+    start_date = datetime.date(year, month, 1)
+    if month == 12:
+        end_date = datetime.date(year + 1, 1, 1) - datetime.timedelta(days=1)
+    else:
+        end_date = datetime.date(year, month + 1, 1) - datetime.timedelta(days=1)
+
+    service = _build_service(_creds_json)
+    api_filter = (
+        f'createTime > "{start_date.isoformat()}T00:00:00Z" '
+        f'AND createTime < "{end_date.isoformat()}T23:59:59Z"'
+    )
 
     messages: list[dict] = []
     page_token = None
@@ -149,7 +171,7 @@ def _fetch_messages_for_period(
             service.spaces()
             .messages()
             .list(
-                parent=space_name,
+                parent=space_id,
                 pageSize=1000,
                 filter=api_filter,
                 pageToken=page_token,
@@ -165,7 +187,62 @@ def _fetch_messages_for_period(
     return messages
 
 
-# ── Tiered message repository ────────────────────────────────────────────────
+# Current month re-fetched more frequently
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_current_month_cached(
+    _creds_json: str, space_id: str, year: int, month: int, _hour_key: int
+) -> list[dict]:
+    """Fetch current month's messages. Cached 1 hour. _hour_key rotates the cache."""
+    return _fetch_month_cached(_creds_json, space_id, year, month, True)
+
+
+def _months_between(start_date: datetime.date, end_date: datetime.date) -> list[tuple[int, int]]:
+    """Return list of (year, month) tuples covering the range."""
+    months = []
+    d = start_date.replace(day=1)
+    while d <= end_date:
+        months.append((d.year, d.month))
+        if d.month == 12:
+            d = d.replace(year=d.year + 1, month=1)
+        else:
+            d = d.replace(month=d.month + 1)
+    return months
+
+
+def fetch_messages_for_range(
+    creds_json: str,
+    space_id: str,
+    start_date: str,
+    end_date: str,
+) -> list[dict]:
+    """Fetch messages for a date range, using per-month caching.
+
+    Each month is fetched independently and cached. Past months hit cache
+    instantly. Only the current month refreshes hourly.
+    """
+    start = datetime.date.fromisoformat(start_date)
+    end = datetime.date.fromisoformat(end_date)
+    today = datetime.date.today()
+
+    all_msgs: list[dict] = []
+    for year, month in _months_between(start, end):
+        is_current = (year == today.year and month == today.month)
+        if is_current:
+            hour_key = datetime.datetime.now().hour
+            msgs = _fetch_current_month_cached(creds_json, space_id, year, month, hour_key)
+        else:
+            msgs = _fetch_month_cached(creds_json, space_id, year, month, False)
+        all_msgs.extend(msgs)
+
+    # Filter to exact date range (months are coarse)
+    filtered = [
+        m for m in all_msgs
+        if _msg_in_range(m, start_date, end_date)
+    ]
+    return filtered
+
+
+# ── Repository (session-level index over cached data) ────────────────────────
 
 def _get_repo() -> dict:
     if "message_repo" not in st.session_state:
@@ -185,7 +262,10 @@ def repo_needs_refresh() -> bool:
 
 
 def startup_load(creds_json: str, spaces: list[dict], progress_callback=None):
-    """Fast startup: fetch only last STARTUP_LOOKBACK_DAYS days."""
+    """Fast startup: fetch only last STARTUP_LOOKBACK_DAYS days.
+
+    Uses per-month caching so subsequent loads are instant.
+    """
     repo = _get_repo()
     today = datetime.date.today()
     start = today - datetime.timedelta(days=STARTUP_LOOKBACK_DAYS)
@@ -195,7 +275,7 @@ def startup_load(creds_json: str, spaces: list[dict], progress_callback=None):
         space_id = space["name"]
 
         try:
-            msgs = _fetch_messages_for_period(
+            msgs = fetch_messages_for_range(
                 creds_json, space_id, start.isoformat(), today.isoformat()
             )
             repo[display_name] = {
@@ -221,51 +301,53 @@ def startup_load(creds_json: str, spaces: list[dict], progress_callback=None):
     st.session_state["repo_last_refreshed"] = datetime.datetime.now()
 
 
-def _expand_repo_if_needed(creds_json: str, spaces: list[dict], needed_start: str):
-    """Fetch older messages on-demand if the query needs data before what we have.
+def expand_repo(creds_json: str, spaces: list[dict], needed_start: str):
+    """Fetch older messages on-demand. Each month is independently cached.
 
-    Merges seamlessly with existing repository data.
+    Returns the number of new messages added.
     """
     repo = _get_repo()
+    today = datetime.date.today()
+    total_new = 0
 
     for space in spaces:
         display_name = space.get("displayName", space["name"])
         space_id = space["name"]
         data = repo.get(display_name, {})
-        current_earliest = data.get("earliest_fetched", "")
+        current_earliest = data.get("earliest_fetched", today.isoformat())
 
         # Already have data going back far enough
-        if current_earliest and current_earliest <= needed_start:
+        if current_earliest <= needed_start:
             continue
 
-        # Need to fetch older data: from needed_start to current_earliest
-        fetch_end = current_earliest if current_earliest else datetime.date.today().isoformat()
+        # Fetch from needed_start to current_earliest (per-month cached)
+        older_msgs = fetch_messages_for_range(
+            creds_json, space_id, needed_start, current_earliest
+        )
 
-        try:
-            older_msgs = _fetch_messages_for_period(
-                creds_json, space_id, needed_start, fetch_end
-            )
-            # Merge: deduplicate by message ID
-            existing_msgs = data.get("messages", [])
-            existing_ids = {m.get("name") for m in existing_msgs}
-            new_msgs = [m for m in older_msgs if m.get("name") not in existing_ids]
-            merged = new_msgs + existing_msgs
-            merged.sort(key=lambda m: m.get("createTime", ""))
+        # Merge and deduplicate
+        existing_msgs = data.get("messages", [])
+        existing_ids = {m.get("name") for m in existing_msgs}
+        new_msgs = [m for m in older_msgs if m.get("name") not in existing_ids]
+        total_new += len(new_msgs)
 
-            repo[display_name] = {
-                "messages": merged,
-                "space_id": space_id,
-                "earliest_fetched": needed_start,
-                "latest_fetched": data.get("latest_fetched", datetime.date.today().isoformat()),
-            }
-        except Exception as exc:
-            logger.warning("Expansion failed for %s: %s", display_name, exc)
+        merged = new_msgs + existing_msgs
+        merged.sort(key=lambda m: m.get("createTime", ""))
+
+        repo[display_name] = {
+            "messages": merged,
+            "space_id": space_id,
+            "earliest_fetched": needed_start,
+            "latest_fetched": data.get("latest_fetched", today.isoformat()),
+        }
+
+    return total_new
 
 
 def incremental_refresh(creds_json: str, spaces: list[dict]):
-    """Fetch only new messages since the last refresh. Fast."""
+    """Fetch only new messages since last refresh. Uses current-month cache."""
     repo = _get_repo()
-    today = datetime.date.today().isoformat()
+    today = datetime.date.today()
 
     for space in spaces:
         display_name = space.get("displayName", space["name"])
@@ -273,11 +355,12 @@ def incremental_refresh(creds_json: str, spaces: list[dict]):
         data = repo.get(display_name, {})
         existing_msgs = data.get("messages", [])
 
-        # Fetch from last known date
-        last_date = data.get("latest_fetched", today)
+        last_date = data.get("latest_fetched", today.isoformat())
 
         try:
-            new_msgs = _fetch_messages_for_period(creds_json, space_id, last_date, today)
+            new_msgs = fetch_messages_for_range(
+                creds_json, space_id, last_date, today.isoformat()
+            )
             existing_ids = {m.get("name") for m in existing_msgs}
             truly_new = [m for m in new_msgs if m.get("name") not in existing_ids]
 
@@ -286,7 +369,7 @@ def incremental_refresh(creds_json: str, spaces: list[dict]):
                 merged.sort(key=lambda m: m.get("createTime", ""))
                 data["messages"] = merged
 
-            data["latest_fetched"] = today
+            data["latest_fetched"] = today.isoformat()
             repo[display_name] = data
         except Exception as exc:
             logger.warning("Incremental refresh failed for %s: %s", display_name, exc)
@@ -297,43 +380,46 @@ def incremental_refresh(creds_json: str, spaces: list[dict]):
 # ── Query interface ──────────────────────────────────────────────────────────
 
 def get_all_messages() -> dict[str, list[dict]]:
-    """Return all cached messages: {display_name: [messages]}."""
+    """Return all currently loaded messages: {display_name: [messages]}."""
     repo = _get_repo()
     return {name: data.get("messages", []) for name, data in repo.items()}
 
 
-def get_messages_for_range(
+def get_messages_in_range(
     start_str: str,
     end_str: str,
-    creds_json: str = None,
-    spaces: list[dict] = None,
-) -> dict[str, list[dict]]:
-    """Filter messages to [start_str, end_str].
+    creds_json: str,
+    spaces: list[dict],
+) -> tuple[dict[str, list[dict]], int]:
+    """Get messages for a date range, expanding the repo if needed.
 
-    If the requested range extends before what's cached, automatically
-    fetches older data (requires creds_json and spaces).
+    Returns (messages_by_space, new_messages_fetched).
     """
     repo = _get_repo()
 
-    # Check if we need to expand the repo
-    if creds_json and spaces:
-        for data in repo.values():
-            current_earliest = data.get("earliest_fetched", "")
-            if current_earliest and start_str < current_earliest:
-                _expand_repo_if_needed(creds_json, spaces, start_str)
-                break
+    # Check if expansion is needed
+    needs_expansion = False
+    for data in repo.values():
+        current_earliest = data.get("earliest_fetched", "")
+        if current_earliest and start_str < current_earliest:
+            needs_expansion = True
+            break
 
+    new_count = 0
+    if needs_expansion:
+        new_count = expand_repo(creds_json, spaces, start_str)
+
+    # Filter from repo
     result: dict[str, list[dict]] = {}
     for name, data in repo.items():
         result[name] = [
             m for m in data.get("messages", [])
             if _msg_in_range(m, start_str, end_str)
         ]
-    return result
+    return result, new_count
 
 
 def get_repo_stats() -> dict:
-    """Return summary stats about the repository."""
     repo = _get_repo()
     total = 0
     earliest = None

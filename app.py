@@ -32,7 +32,7 @@ from chat_api import (
     repo_needs_refresh,
     repo_last_refreshed,
     get_all_messages,
-    get_messages_for_range,
+    get_messages_in_range,
     get_repo_stats,
 )
 from message_utils import (
@@ -326,16 +326,19 @@ with tab_chat:
                         q_start, q_end = date_range
                         date_label = f"{q_start} to {q_end}"
 
-                        # This automatically fetches older data if needed
-                        with st.spinner(f"Searching messages ({date_label})..."):
-                            q_messages_by_space = get_messages_for_range(
+                        # This auto-fetches older data if needed (per-month cached)
+                        with st.spinner(f"Fetching messages ({date_label})..."):
+                            q_messages_by_space, new_count = get_messages_in_range(
                                 q_start, q_end,
                                 creds_json=creds_json,
                                 spaces=spaces,
                             )
                             chat_context = build_conversation_context(q_messages_by_space)
                             total_q = sum(len(v) for v in q_messages_by_space.values())
-                        st.caption(f"📅 {date_label} — {total_q:,} messages")
+                        info = f"📅 {date_label} — {total_q:,} messages"
+                        if new_count > 0:
+                            info += f" ({new_count:,} newly fetched, now cached)"
+                        st.caption(info)
                     else:
                         # No date in query — use all loaded messages
                         chat_context = conversation_context
