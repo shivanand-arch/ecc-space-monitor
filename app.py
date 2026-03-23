@@ -145,11 +145,18 @@ with st.sidebar:
         stats = get_repo_stats()
         st.divider()
         st.markdown("**Message Repository**")
-        st.caption(f"{stats['total']:,} messages loaded")
+        st.caption(f"{stats['total']:,} messages in session")
         if stats["earliest"] and stats["latest"]:
             st.caption(f"Coverage: {stats['earliest']} to {stats['latest']}")
         st.caption(f"Last refresh: {_rr.strftime('%I:%M %p')}")
-        st.caption("Older data fetched automatically on demand")
+        st.caption("Older data fetched on demand + persisted to cloud")
+        try:
+            from storage import get_storage_stats
+            ss = get_storage_stats()
+            if ss["chunks"] > 0:
+                st.caption(f"DB: {ss['total_messages']:,} msgs, {ss['db_size_mb']}MB, {ss['chunks']} chunks")
+        except Exception:
+            pass
 
     st.divider()
     if st.button("Clear Chat History", use_container_width=True):

@@ -133,32 +133,20 @@ def fetch_spaces(_creds_json: str) -> list[dict]:
     return matched
 
 
-# ── CACHED per-month message fetch ──────────────────────────────────────────
-# The key insight: we fetch by (space_id, year, month) and cache each chunk
-# for 24 hours. The current month is re-fetched each hour to pick up new
-# messages. Past months are immutable and cached for a full day.
+# ── Per-month message fetch with SQLite + GCS persistence ────────────────────
+# Priority: SQLite (instant) → API (slow) → store in SQLite + sync to GCS
+# Past months are immutable — fetched once, stored forever.
+# Current month is re-fetched hourly to pick up new messages.
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def _fetch_month_cached(
-    _creds_json: str,
-    space_id: str,
-    year: int,
-    month: int,
-    _is_current_month: bool,  # used to vary TTL via cache key
-) -> list[dict]:
-    """Fetch all messages from a space for a given month.
-
-    Past months: cached 24h (immutable data).
-    Current month: cache key includes _is_current_month=True, which changes
-    the effective TTL via a separate cache entry.
-    """
+def _fetch_month_from_api(creds_json: str, space_id: str, year: int, month: int) -> list[dict]:
+    """Fetch all messages from a space for a given month via Google Chat API."""
     start_date = datetime.date(year, month, 1)
     if month == 12:
         end_date = datetime.date(year + 1, 1, 1) - datetime.timedelta(days=1)
     else:
         end_date = datetime.date(year, month + 1, 1) - datetime.timedelta(days=1)
 
-    service = _build_service(_creds_json)
+    service = _build_service(creds_json)
     api_filter = (
         f'createTime > "{start_date.isoformat()}T00:00:00Z" '
         f'AND createTime < "{end_date.isoformat()}T23:59:59Z"'
@@ -187,13 +175,40 @@ def _fetch_month_cached(
     return messages
 
 
-# Current month re-fetched more frequently
+def _get_month_messages(creds_json: str, space_id: str, year: int, month: int) -> list[dict]:
+    """Get messages for a month: SQLite first, then API, then store.
+
+    Past months: check SQLite → if missing, fetch from API and store permanently.
+    Current month: always re-fetch from API (hourly via st.cache_data).
+    """
+    from storage import get_cached_month, store_month, is_current_month
+
+    current = is_current_month(year, month)
+
+    if not current:
+        # Past month — check SQLite first (permanent cache)
+        cached = get_cached_month(space_id, year, month)
+        if cached is not None:
+            return cached
+
+    # Fetch from API (current month always, past month if not in SQLite)
+    messages = _fetch_month_from_api_cached(creds_json, space_id, year, month, current)
+
+    # Store in SQLite for persistence
+    store_month(space_id, year, month, messages)
+
+    return messages
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def _fetch_current_month_cached(
-    _creds_json: str, space_id: str, year: int, month: int, _hour_key: int
+def _fetch_month_from_api_cached(
+    _creds_json: str, space_id: str, year: int, month: int, _is_current: bool
 ) -> list[dict]:
-    """Fetch current month's messages. Cached 1 hour. _hour_key rotates the cache."""
-    return _fetch_month_cached(_creds_json, space_id, year, month, True)
+    """Thin st.cache_data wrapper around the API fetch.
+
+    Provides in-memory caching (1h) on top of SQLite persistence.
+    """
+    return _fetch_month_from_api(_creds_json, space_id, year, month)
 
 
 def _months_between(start_date: datetime.date, end_date: datetime.date) -> list[tuple[int, int]]:
@@ -226,12 +241,7 @@ def fetch_messages_for_range(
 
     all_msgs: list[dict] = []
     for year, month in _months_between(start, end):
-        is_current = (year == today.year and month == today.month)
-        if is_current:
-            hour_key = datetime.datetime.now().hour
-            msgs = _fetch_current_month_cached(creds_json, space_id, year, month, hour_key)
-        else:
-            msgs = _fetch_month_cached(creds_json, space_id, year, month, False)
+        msgs = _get_month_messages(creds_json, space_id, year, month)
         all_msgs.extend(msgs)
 
     # Filter to exact date range (months are coarse)
@@ -264,8 +274,11 @@ def repo_needs_refresh() -> bool:
 def startup_load(creds_json: str, spaces: list[dict], progress_callback=None):
     """Fast startup: fetch only last STARTUP_LOOKBACK_DAYS days.
 
-    Uses per-month caching so subsequent loads are instant.
+    Uses per-month caching + SQLite persistence so subsequent loads are instant.
     """
+    from storage import init_storage, sync_to_gcs
+    init_storage()
+
     repo = _get_repo()
     today = datetime.date.today()
     start = today - datetime.timedelta(days=STARTUP_LOOKBACK_DAYS)
@@ -298,6 +311,8 @@ def startup_load(creds_json: str, spaces: list[dict], progress_callback=None):
         if progress_callback:
             progress_callback((i + 1) / len(spaces))
 
+    # Sync SQLite to GCS for persistence across reboots
+    sync_to_gcs()
     st.session_state["repo_last_refreshed"] = datetime.datetime.now()
 
 
@@ -340,6 +355,11 @@ def expand_repo(creds_json: str, spaces: list[dict], needed_start: str):
             "earliest_fetched": needed_start,
             "latest_fetched": data.get("latest_fetched", today.isoformat()),
         }
+
+    # Sync to GCS after expansion
+    if total_new > 0:
+        from storage import sync_to_gcs
+        sync_to_gcs()
 
     return total_new
 
